@@ -2356,7 +2356,18 @@ export default function AranetUnifiedDashboard() {
     const allDropsSorted = Object.values(dropsByIdAllDays).sort((a, b) => a.time - b.time);
 
     return Object.keys(daysMap).map((dateStr, index) => {
-      const rows = [...daysMap[dateStr], ...(daysMapFerti[dateStr] || [])];
+      // Merge by timestamp rather than concatenating: agroFertiChartData bins its own raw data
+      // map directly (no buildChartRows pass, so no divisor/multiplier conversion and no weight-
+      // drop correction), and since plant_weight_gain is unconditionally part of agroAnalysisKeys
+      // it gets fetched into BOTH maps - concatenating produced two unit-inconsistent versions of
+      // plant_weight_gain per day (corrected kg/m² from daysMap, raw uncorrected from
+      // daysMapFerti), and the first/last-reading gain calc below could pick either one depending
+      // on sort order, producing wildly wrong cumulative gain. Applying daysMap last so its
+      // corrected values win over any raw duplicate for the same key/timestamp.
+      const rowsByTime: { [t: number]: any } = {};
+      (daysMapFerti[dateStr] || []).forEach(r => { rowsByTime[r.time] = { ...rowsByTime[r.time], ...r }; });
+      (daysMap[dateStr] || []).forEach(r => { rowsByTime[r.time] = { ...rowsByTime[r.time], ...r }; });
+      const rows = Object.values(rowsByTime);
       const audits: any[] = [];
       let lostPercent = 0;
       let score = 100;
