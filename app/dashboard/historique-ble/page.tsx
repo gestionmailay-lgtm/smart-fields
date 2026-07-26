@@ -9,23 +9,23 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, Legend } from "recharts"
 
 const summaryData = [
-  { year: "2016", spot: 160.6, smart-fields: 165.5 },
-  { year: "2017", spot: 168.3, smart-fields: 175.0 },
-  { year: "2018", spot: 183.9, smart-fields: 200.5 },
-  { year: "2019", spot: 185.4, smart-fields: 198.0 },
-  { year: "2020", spot: 194.3, smart-fields: 208.5 },
-  { year: "2021", spot: 245.4, smart-fields: 270.0 },
-  { year: "2022", spot: 344.2, smart-fields: 385.0 },
-  { year: "2023", spot: 250.4, smart-fields: 280.0 },
-  { year: "2024", spot: 220.0, smart-fields: 235.0 },
-  { year: "2025", spot: 242.1, smart-fields: 255.0 },
+  { year: "2016", spot: 160.6, smartFields: 165.5 },
+  { year: "2017", spot: 168.3, smartFields: 175.0 },
+  { year: "2018", spot: 183.9, smartFields: 200.5 },
+  { year: "2019", spot: 185.4, smartFields: 198.0 },
+  { year: "2020", spot: 194.3, smartFields: 208.5 },
+  { year: "2021", spot: 245.4, smartFields: 270.0 },
+  { year: "2022", spot: 344.2, smartFields: 385.0 },
+  { year: "2023", spot: 250.4, smartFields: 280.0 },
+  { year: "2024", spot: 220.0, smartFields: 235.0 },
+  { year: "2025", spot: 242.1, smartFields: 255.0 },
 ]
 
 const detailedHistory = [
   {
     year: 2025,
     spotAvg: 242.1,
-    smart-fieldsAvg: 255.0,
+    smartFieldsAvg: 255.0,
     gain: "5.3%",
     quarters: [
       {
@@ -57,7 +57,7 @@ const detailedHistory = [
   {
     year: 2024,
     spotAvg: 220.0,
-    smart-fieldsAvg: 235.0,
+    smartFieldsAvg: 235.0,
     gain: "6.8%",
     quarters: [
       {
@@ -89,7 +89,7 @@ const detailedHistory = [
   {
     year: 2023,
     spotAvg: 250.4,
-    smart-fieldsAvg: 280.0,
+    smartFieldsAvg: 280.0,
     gain: "11.8%",
     quarters: [
       {
@@ -121,7 +121,7 @@ const detailedHistory = [
   {
     year: 2022,
     spotAvg: 344.2,
-    smart-fieldsAvg: 385.0,
+    smartFieldsAvg: 385.0,
     gain: "11.8%",
     quarters: [
       {
@@ -154,7 +154,7 @@ const detailedHistory = [
   {
     year: 2021,
     spotAvg: 245.4,
-    smart-fieldsAvg: 270.0,
+    smartFieldsAvg: 270.0,
     gain: "10.0%",
     quarters: [
       {
@@ -186,7 +186,7 @@ const detailedHistory = [
   {
     year: 2020,
     spotAvg: 194.3,
-    smart-fieldsAvg: 208.5,
+    smartFieldsAvg: 208.5,
     gain: "7.3%",
     quarters: [
       {
@@ -218,7 +218,7 @@ const detailedHistory = [
   {
     year: 2019,
     spotAvg: 185.4,
-    smart-fieldsAvg: 198.0,
+    smartFieldsAvg: 198.0,
     gain: "6.8%",
     quarters: [
       {
@@ -250,7 +250,7 @@ const detailedHistory = [
   {
     year: 2018,
     spotAvg: 183.9,
-    smart-fieldsAvg: 200.5,
+    smartFieldsAvg: 200.5,
     gain: "9.0%",
     quarters: [
       {
@@ -282,7 +282,7 @@ const detailedHistory = [
   {
     year: 2017,
     spotAvg: 168.3,
-    smart-fieldsAvg: 175.0,
+    smartFieldsAvg: 175.0,
     gain: "4.0%",
     quarters: [
       {
@@ -314,7 +314,7 @@ const detailedHistory = [
   {
     year: 2016,
     spotAvg: 160.6,
-    smart-fieldsAvg: 165.5,
+    smartFieldsAvg: 165.5,
     gain: "3.1%",
     quarters: [
       {
@@ -439,7 +439,7 @@ export default function HistoriqueBlePage() {
                       <stop offset="5%" stopColor="#94a3b8" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#94a3b8" stopOpacity={0}/>
                     </linearGradient>
-                    <linearGradient id="colorSmart Fields" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="colorSmartFields" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#d97706" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#d97706" stopOpacity={0}/>
                     </linearGradient>
@@ -453,7 +453,7 @@ export default function HistoriqueBlePage() {
                   />
                   <Legend verticalAlign="top" height={36} iconType="circle" />
                   <Area type="monotone" name="Prix Spot Moyen MATIF" dataKey="spot" stroke="#94a3b8" strokeWidth={2} fillOpacity={1} fill="url(#colorSpot)" />
-                  <Area type="monotone" name="Prix Vente Moyen Smart Fields" dataKey="smart-fields" stroke="#d97706" strokeWidth={3} fillOpacity={1} fill="url(#colorSmart Fields)" />
+                  <Area type="monotone" name="Prix Vente Moyen Smart Fields" dataKey="smartFields" stroke="#d97706" strokeWidth={3} fillOpacity={1} fill="url(#colorSmartFields)" />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -485,7 +485,7 @@ export default function HistoriqueBlePage() {
                     <div>
                       <div className="flex items-center gap-3 mb-1">
                          <span className="text-sm text-slate-500">Spot MATIF: <strong className="text-slate-700">{yearData.spotAvg} €</strong></span>
-                         <span className="text-sm text-slate-500">Vente Smart Fields: <strong className="text-amber-600">{yearData.smart-fieldsAvg} €</strong></span>
+                         <span className="text-sm text-slate-500">Vente Smart Fields: <strong className="text-amber-600">{yearData.smartFieldsAvg} €</strong></span>
                       </div>
                       <div className="flex items-center gap-2">
                          <Badge variant="outline" className="bg-green-100 text-green-700 hover:bg-green-100 border-none font-semibold">

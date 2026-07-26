@@ -11,23 +11,23 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsToolti
 
 // Mock Data for 10 years
 const summaryData = [
-  { year: "2016", spot: 15.5, smart-fields: 14.8 },
-  { year: "2017", spot: 18.0, smart-fields: 16.5 },
-  { year: "2018", spot: 23.5, smart-fields: 21.8 },
-  { year: "2019", spot: 14.2, smart-fields: 13.9 },
-  { year: "2020", spot: 11.5, smart-fields: 10.8 },
-  { year: "2021", spot: 47.0, smart-fields: 32.5 },
-  { year: "2022", spot: 123.0, smart-fields: 35.0 },
-  { year: "2023", spot: 42.0, smart-fields: 36.5 },
-  { year: "2024", spot: 32.0, smart-fields: 28.0 },
-  { year: "2025", spot: 30.0, smart-fields: 26.5 },
+  { year: "2016", spot: 15.5, smartFields: 14.8 },
+  { year: "2017", spot: 18.0, smartFields: 16.5 },
+  { year: "2018", spot: 23.5, smartFields: 21.8 },
+  { year: "2019", spot: 14.2, smartFields: 13.9 },
+  { year: "2020", spot: 11.5, smartFields: 10.8 },
+  { year: "2021", spot: 47.0, smartFields: 32.5 },
+  { year: "2022", spot: 123.0, smartFields: 35.0 },
+  { year: "2023", spot: 42.0, smartFields: 36.5 },
+  { year: "2024", spot: 32.0, smartFields: 28.0 },
+  { year: "2025", spot: 30.0, smartFields: 26.5 },
 ]
 
 const detailedHistory = [
   {
     year: 2025,
     spotAvg: 30.0,
-    smart-fieldsAvg: 26.5,
+    smartFieldsAvg: 26.5,
     savings: "11.6%",
     quarters: [
       {
@@ -59,7 +59,7 @@ const detailedHistory = [
   {
     year: 2024,
     spotAvg: 32.0,
-    smart-fieldsAvg: 28.0,
+    smartFieldsAvg: 28.0,
     savings: "12.5%",
     quarters: [
       {
@@ -91,7 +91,7 @@ const detailedHistory = [
   {
     year: 2023,
     spotAvg: 42.0,
-    smart-fieldsAvg: 36.5,
+    smartFieldsAvg: 36.5,
     savings: "13.1%",
     quarters: [
       {
@@ -124,7 +124,7 @@ const detailedHistory = [
   {
     year: 2022,
     spotAvg: 123.0,
-    smart-fieldsAvg: 35.0,
+    smartFieldsAvg: 35.0,
     savings: "71.5%",
     quarters: [
       {
@@ -156,7 +156,7 @@ const detailedHistory = [
   {
     year: 2021,
     spotAvg: 47.0,
-    smart-fieldsAvg: 32.5,
+    smartFieldsAvg: 32.5,
     savings: "30.8%",
     quarters: [
       {
@@ -188,7 +188,7 @@ const detailedHistory = [
   {
     year: 2020,
     spotAvg: 11.5,
-    smart-fieldsAvg: 10.8,
+    smartFieldsAvg: 10.8,
     savings: "6.1%",
     quarters: [
       {
@@ -220,7 +220,7 @@ const detailedHistory = [
   {
     year: 2019,
     spotAvg: 14.2,
-    smart-fieldsAvg: 13.9,
+    smartFieldsAvg: 13.9,
     savings: "2.1%",
     quarters: [
       {
@@ -252,7 +252,7 @@ const detailedHistory = [
   {
     year: 2018,
     spotAvg: 23.5,
-    smart-fieldsAvg: 21.8,
+    smartFieldsAvg: 21.8,
     savings: "7.2%",
     quarters: [
       {
@@ -284,7 +284,7 @@ const detailedHistory = [
   {
     year: 2017,
     spotAvg: 18.0,
-    smart-fieldsAvg: 16.5,
+    smartFieldsAvg: 16.5,
     savings: "8.3%",
     quarters: [
       {
@@ -316,7 +316,7 @@ const detailedHistory = [
   {
     year: 2016,
     spotAvg: 15.5,
-    smart-fieldsAvg: 14.8,
+    smartFieldsAvg: 14.8,
     savings: "4.5%",
     quarters: [
       {
@@ -441,7 +441,7 @@ export default function HistoriqueGazPage() {
                       <stop offset="5%" stopColor="#94a3b8" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#94a3b8" stopOpacity={0}/>
                     </linearGradient>
-                    <linearGradient id="colorSmart Fields" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="colorSmartFields" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#f97316" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#f97316" stopOpacity={0}/>
                     </linearGradient>
@@ -455,7 +455,7 @@ export default function HistoriqueGazPage() {
                   />
                   <Legend verticalAlign="top" height={36} iconType="circle" />
                   <Area type="monotone" name="Prix Spot Moyen" dataKey="spot" stroke="#94a3b8" strokeWidth={2} fillOpacity={1} fill="url(#colorSpot)" />
-                  <Area type="monotone" name="Stratégie Smart Fields" dataKey="smart-fields" stroke="#f97316" strokeWidth={3} fillOpacity={1} fill="url(#colorSmart Fields)" />
+                  <Area type="monotone" name="Stratégie Smart Fields" dataKey="smartFields" stroke="#f97316" strokeWidth={3} fillOpacity={1} fill="url(#colorSmartFields)" />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -487,7 +487,7 @@ export default function HistoriqueGazPage() {
                     <div>
                       <div className="flex items-center gap-3 mb-1">
                          <span className="text-sm text-slate-500">Spot: <strong className="text-slate-700">{yearData.spotAvg} €</strong></span>
-                         <span className="text-sm text-slate-500">Smart Fields: <strong className="text-orange-600">{yearData.smart-fieldsAvg} €</strong></span>
+                         <span className="text-sm text-slate-500">Smart Fields: <strong className="text-orange-600">{yearData.smartFieldsAvg} €</strong></span>
                       </div>
                       <div className="flex items-center gap-2">
                          <Badge variant="outline" className="bg-green-100 text-green-700 hover:bg-green-100 border-none font-semibold">
