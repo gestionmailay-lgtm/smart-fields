@@ -40,12 +40,21 @@ async function recompute(supabase: ReturnType<typeof createAdminClient>) {
   const byDate = new Map(rows.map(r => [r.date as string, r]));
 
   // Union of every numeric factor key ever seen, across the top-level radiation_sum_jcm2 field
-  // and every key inside the `climate` jsonb blob (tempAvg, vpdAvg, wcAvg, ecAvg, co2Avg, ...).
+  // and every role/slot leaf inside the `climate` jsonb blob (now nested as
+  // { role: { slotLabel: avg } } - see plan - so each role is correlated per agronomic time
+  // slot rather than on a single 24h average, since a factor's target genuinely differs by
+  // slot). Composite key: "role__slotLabel" (e.g. "temp_serre__Midi"). A handful of older rows
+  // computed before this change still have a flat { role: number } shape - harmless, they just
+  // never match a composite key and are ignored here.
   const factorKeys = new Set<string>(["radiation_sum_jcm2"]);
   rows.forEach(r => {
     const climate = (r.climate || {}) as Record<string, any>;
-    Object.entries(climate).forEach(([k, v]) => {
-      if (typeof v === "number" && !EXCLUDED_FACTORS.has(k)) factorKeys.add(k);
+    Object.entries(climate).forEach(([role, bySlot]) => {
+      if (typeof bySlot !== "object" || bySlot === null) return;
+      Object.entries(bySlot).forEach(([slotLabel, v]) => {
+        const key = `${role}__${slotLabel}`;
+        if (typeof v === "number" && !EXCLUDED_FACTORS.has(role)) factorKeys.add(key);
+      });
     });
   });
 
@@ -53,7 +62,11 @@ async function recompute(supabase: ReturnType<typeof createAdminClient>) {
 
   const getFactorValue = (row: any, key: string): number | null => {
     if (key === "radiation_sum_jcm2") return typeof row.radiation_sum_jcm2 === "number" ? row.radiation_sum_jcm2 : null;
-    const v = (row.climate || {})[key];
+    const sep = key.indexOf("__");
+    if (sep === -1) return null;
+    const role = key.slice(0, sep);
+    const slotLabel = key.slice(sep + 2);
+    const v = ((row.climate || {})[role] || {})[slotLabel];
     return typeof v === "number" ? v : null;
   };
 

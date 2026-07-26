@@ -1,5 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
+import { AGRO_TIME_SLOTS, isHourInSlot } from "@/lib/agroRoleMapping";
+
+// Every Priva metric key encodes its compartment (1-6) as "priva_cN_...". Aranet sensors
+// (ARANET_SENSOR_CATALOG below) all belong to a single physical compartment today, matching the
+// dashboard's "Compartiment 1 (Aranet + Priva)" option - so they default to compartment "1".
+function resolveCompartment(metricKey: string): string {
+  const match = metricKey.match(/^priva_c(\d+)_/);
+  return match ? match[1] : "1";
+}
 
 // Ignore SSL verification errors for Aranet Cloud API, same as app/api/aranet/route.ts.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -102,7 +111,8 @@ async function archivePrivaForDay(
       value,
       unit: null,
       archived_for_date: dateStr,
-      agro_role: roleByMetricKey.get(point.metric_key) || null
+      agro_role: roleByMetricKey.get(point.metric_key) || null,
+      compartment: resolveCompartment(point.metric_key)
     }));
 
     for (let i = 0; i < rows.length; i += 500) {
@@ -188,15 +198,26 @@ async function computeAndUpsertAgroSummary(
   });
 
   // The agro role IS the climate field name now (homogenized vocabulary - see plan) - no
-  // role-to-field translation table needed anymore.
-  const climate: { [role: string]: number } = {};
+  // role-to-field translation table needed anymore. Averaged per agronomic time slot (Nuit,
+  // Matin, Midi, Après-midi, Soir - same AGRO_TIME_SLOTS/isHourInSlot already used identically
+  // in agro-target-ranges/route.ts), not over the full 24h, since the target for a factor
+  // genuinely differs between slots and a single daily average masks slot-specific deviations.
+  const climate: { [role: string]: { [slotLabel: string]: number } } = {};
   const usedRoles = new Set<string>();
   byMetricKey.forEach((readings, metricKey) => {
     const role = roleByMetricKey.get(metricKey);
     if (!role || usedRoles.has(role)) return; // first tagged sensor wins, same as keysByRole()[0] client-side
-    const avg = readings.reduce((sum, r) => sum + r.value, 0) / readings.length;
-    climate[role] = Number(avg.toFixed(3));
-    usedRoles.add(role);
+    const bySlot: { [slotLabel: string]: number } = {};
+    AGRO_TIME_SLOTS.forEach(slot => {
+      const inSlot = readings.filter(r => isHourInSlot(new Date(r.time).getHours(), slot.start, slot.end));
+      if (inSlot.length === 0) return;
+      const avg = inSlot.reduce((sum, r) => sum + r.value, 0) / inSlot.length;
+      bySlot[slot.label] = Number(avg.toFixed(3));
+    });
+    if (Object.keys(bySlot).length > 0) {
+      climate[role] = bySlot;
+      usedRoles.add(role);
+    }
   });
 
   let radiationSumJcm2: number | null = null;
@@ -319,7 +340,8 @@ export async function GET(req: NextRequest) {
           value,
           unit: defaultUnit,
           archived_for_date: dateStr,
-          agro_role: roleByMetricKey.get(metricKey) || null
+          agro_role: roleByMetricKey.get(metricKey) || null,
+          compartment: resolveCompartment(metricKey)
         }));
 
         // Chunk inserts to stay well under request size limits.

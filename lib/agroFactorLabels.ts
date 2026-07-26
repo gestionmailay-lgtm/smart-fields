@@ -46,9 +46,18 @@ export const AGRO_FACTOR_LABELS: { [factorKey: string]: string } = {
 // Strips the "_lag1" (previous-day) suffix used by /api/agro-correlations before lookup, and
 // appends "(jour précédent)" to the resolved label instead of the raw key. `labelsByKey`, when
 // provided, is the live agro_roles catalog and takes priority over the static fallback above.
+// Since agro_daily_summary.climate is now nested per agronomic time slot (see plan),
+// /api/agro-correlations emits composite keys "role__slotLabel" (e.g. "temp_serre__Midi") -
+// split on "__" before resolving the role's label and append the slot name in parens.
 export function formatAgroFactorLabel(factorKey: string, labelsByKey?: { [key: string]: string }): string {
   const isLag = factorKey.endsWith("_lag1");
   const baseKey = isLag ? factorKey.slice(0, -"_lag1".length) : factorKey;
-  const label = labelsByKey?.[baseKey] || AGRO_FACTOR_LABELS[baseKey] || baseKey;
+
+  const sep = baseKey.indexOf("__");
+  const roleKey = sep === -1 ? baseKey : baseKey.slice(0, sep);
+  const slotLabel = sep === -1 ? null : baseKey.slice(sep + 2);
+
+  const roleLabel = labelsByKey?.[roleKey] || AGRO_FACTOR_LABELS[roleKey] || roleKey;
+  const label = slotLabel ? `${roleLabel} (${slotLabel})` : roleLabel;
   return isLag ? `${label} (jour précédent)` : label;
 }

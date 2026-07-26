@@ -29,11 +29,11 @@ async function fetchArchiveForDate(supabase: ReturnType<typeof createAdminClient
   // Filters to agro_role is not null at the query level - archive-daily now tags every row with
   // its resolved role at write time, so there's no need to separately load aranet_metric_roles
   // and cross-reference metric_key -> role in memory here anymore.
-  const rows: { reading_time: string; value: number; agro_role: string }[] = [];
+  const rows: { reading_time: string; value: number; agro_role: string; compartment: string | null }[] = [];
   for (let from = 0; ; from += ARCHIVE_PAGE_SIZE) {
     const { data: page, error } = await supabase
       .from("aranet_daily_archive")
-      .select("reading_time, value, agro_role")
+      .select("reading_time, value, agro_role, compartment")
       .eq("archived_for_date", dateStr)
       .not("agro_role", "is", null)
       .range(from, from + ARCHIVE_PAGE_SIZE - 1);
