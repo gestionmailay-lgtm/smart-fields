@@ -347,11 +347,18 @@ function detectWeightMovements(
     const eventTime = readings[strongest.idx].time;
     const prevScale = readings[strongest.idx - 1]?.rawScaleWeight ?? readings[strongest.idx].rawScaleWeight;
 
-    // Skip if the weight recovers close to its prior level within 30 minutes (temporary fluctuation,
-    // not a real, lasting movement). For a drop it must not bounce back up; for a rise it must not
-    // sag back down.
-    const thirtyMinsLater = eventTime + 30 * 60 * 1000;
-    const postReadings = readings.filter(r => r.time > eventTime && r.time <= thirtyMinsLater);
+    // Skip if the weight recovers close to its prior level (temporary fluctuation, not a real,
+    // lasting movement). A drop (harvest, thinning) is a permanent removal of biomass - the scale
+    // never climbs back on its own, so 30 minutes is enough to rule out a transient blip. A rise
+    // is different: routine irrigation/fertigation adds water weight to the slab in a sharp pulse,
+    // then that water drains and evaporates via substrate dry-back over several HOURS, not minutes
+    // - so a 30-minute window never sees it recover and every watering pulse was being misread as
+    // a permanent step, each one dragging the rest of that day's corrected curve down. Give "rise"
+    // a window wide enough to cover normal dry-back before deciding it's a genuine lasting movement
+    // (e.g. a scale recalibration).
+    const compensationWindowMs = (strongest.direction === "drop" ? 30 : 240) * 60 * 1000;
+    const compensationDeadline = eventTime + compensationWindowMs;
+    const postReadings = readings.filter(r => r.time > eventTime && r.time <= compensationDeadline);
     const isCompensated = strongest.direction === "drop"
       ? postReadings.some(r => r.rawScaleWeight >= prevScale - 0.005)
       : postReadings.some(r => r.rawScaleWeight <= prevScale + 0.005);
