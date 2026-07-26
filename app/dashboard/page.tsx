@@ -9,7 +9,7 @@ import Link from "next/link"
 import { Wheat, Leaf, Activity, LogOut, LayoutDashboard, Settings, User, Flame, Droplets, TrendingUp } from "lucide-react"
 
 export const metadata: Metadata = {
-  title: "Tableau de bord - Rawwin",
+  title: "Tableau de bord - Smart Fields",
   description: "Vos marchés financiers et stratégies de couverture",
 }
 
@@ -108,7 +108,7 @@ export default async function DashboardPage() {
               Couverture des Marchés
             </h2>
             <p className="text-muted-foreground max-w-2xl text-lg">
-              Sélectionnez le marché que vous souhaitez sécuriser. Nous utilisons l'Intelligence Artificielle Raw'win pour simuler vos coûts de production et vous proposer des stratégies de couverture optimisées.
+              Sélectionnez le marché que vous souhaitez sécuriser. Nous utilisons l'Intelligence Artificielle Smart Fields pour simuler vos coûts de production et vous proposer des stratégies de couverture optimisées.
             </p>
           </div>
 
@@ -193,7 +193,7 @@ export default async function DashboardPage() {
             <CardHeader>
               <CardTitle className="text-2xl flex items-center gap-2">
                 <Activity className="h-6 w-6 text-primary" />
-                Pourquoi utiliser l'Agent IA Raw'win ?
+                Pourquoi utiliser l'Agent IA Smart Fields ?
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4 relative z-10">

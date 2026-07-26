@@ -240,7 +240,7 @@ export default function ProjectionSerresPage() {
       <div className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-6 border-b border-border/50 pb-8">
         <div className="space-y-3">
           <Link href="/dashboard/serres/conseil" className="inline-flex items-center gap-2 text-muted-foreground font-bold text-xs uppercase tracking-widest hover:text-primary transition-colors">
-            <ArrowLeft className="h-4 w-4" /> Retour au Conseil Raw'win
+            <ArrowLeft className="h-4 w-4" /> Retour au Conseil Smart Fields
           </Link>
           <h2 className="text-4xl md:text-5xl font-black tracking-tighter text-foreground uppercase flex items-center gap-4">
             <TrendingUp className="h-10 w-10 text-purple-500" /> 

@@ -110,7 +110,7 @@ const getAiAdvice = (period: string, percentage: number = 0, marketPrices: Recor
       label: "Prix Élevés", 
       color: "bg-red-600", 
       icon: <AlertCircle className="h-3 w-3" />, 
-      text: `${contextText}Le marché est actuellement trop cher (${price}€). Raw'win anticipe une correction à la baisse. Il est préférable de patienter et de limiter votre couverture globale pour le moment.` 
+      text: `${contextText}Le marché est actuellement trop cher (${price}€). Smart Fields anticipe une correction à la baisse. Il est préférable de patienter et de limiter votre couverture globale pour le moment.` 
     }
   }
 
@@ -119,7 +119,7 @@ const getAiAdvice = (period: string, percentage: number = 0, marketPrices: Recor
       label: "Vigilance", 
       color: "bg-orange-500", 
       icon: <TrendingDown className="h-3 w-3" />, 
-      text: `${contextText}Des incertitudes pèsent sur les prix. Raw'win suggère de cibler une couverture globale de 20% pour limiter les risques en cas de hausse soudaine.` 
+      text: `${contextText}Des incertitudes pèsent sur les prix. Smart Fields suggère de cibler une couverture globale de 20% pour limiter les risques en cas de hausse soudaine.` 
     }
   }
 
@@ -128,7 +128,7 @@ const getAiAdvice = (period: string, percentage: number = 0, marketPrices: Recor
       label: "Prix Très Bas", 
       color: "bg-indigo-700", 
       icon: <ShieldCheck className="h-3 w-3" />, 
-      text: `${contextText}Opportunité historique détectée. Raw'win recommande de viser une couverture totale (100%) pour verrouiller ces prix très avantageux.` 
+      text: `${contextText}Opportunité historique détectée. Smart Fields recommande de viser une couverture totale (100%) pour verrouiller ces prix très avantageux.` 
     }
   }
 
@@ -137,7 +137,7 @@ const getAiAdvice = (period: string, percentage: number = 0, marketPrices: Recor
       label: "Bonne Fenêtre", 
       color: "bg-green-600", 
       icon: <Sparkles className="h-3 w-3" />, 
-      text: `${contextText}Les prix sont attractifs (${price}€). Raw'win conseille d'atteindre un niveau de couverture global situé entre 60% et 80% pour sécuriser vos coûts de production.` 
+      text: `${contextText}Les prix sont attractifs (${price}€). Smart Fields conseille d'atteindre un niveau de couverture global situé entre 60% et 80% pour sécuriser vos coûts de production.` 
     }
   }
 
@@ -145,7 +145,7 @@ const getAiAdvice = (period: string, percentage: number = 0, marketPrices: Recor
     label: "Marché Stable", 
     color: "bg-slate-500", 
     icon: <TrendingDown className="h-3 w-3" />, 
-    text: `${contextText}Les prix stagnent. Raw'win surveille l'offre mondiale. Maintenez un niveau de couverture stratégique en attendant une opportunité plus claire.` 
+    text: `${contextText}Les prix stagnent. Smart Fields surveille l'offre mondiale. Maintenez un niveau de couverture stratégique en attendant une opportunité plus claire.` 
   }
 }
 

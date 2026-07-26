@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
-import { ROLE_TO_CLIMATE_FIELD } from "@/lib/agroRoleMapping";
 
 // Ignore SSL verification errors for Aranet Cloud API, same as app/api/aranet/route.ts.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -52,7 +51,8 @@ async function archivePrivaForDay(
   start: Date,
   end: Date,
   dateStr: string,
-  daysAgo: number
+  daysAgo: number,
+  roleByMetricKey: Map<string, string>
 ) {
   if (daysAgo > PRIVA_MAX_DAYS_AGO) {
     return { skipped: true, reason: `Hors fenêtre Priva (max ${PRIVA_MAX_DAYS_AGO} jours en arrière).` };
@@ -101,7 +101,8 @@ async function archivePrivaForDay(
       reading_time: new Date(timeMs).toISOString(),
       value,
       unit: null,
-      archived_for_date: dateStr
+      archived_for_date: dateStr,
+      agro_role: roleByMetricKey.get(point.metric_key) || null
     }));
 
     for (let i = 0; i < rows.length; i += 500) {
@@ -152,14 +153,11 @@ const ARANET_SENSOR_CATALOG: { [key: string]: { sensorId: string; metricId: stri
 // detection/correction, no day/night split - see plan) - if a human later opens the tab for this
 // date, that client-side sync (already in place) overwrites this row with the refined values,
 // since agro_daily_summary is keyed by date.
-async function computeAndUpsertAgroSummary(supabase: ReturnType<typeof createAdminClient>, dateStr: string) {
-  const { data: roleRows, error: rolesError } = await supabase
-    .from("aranet_metric_roles")
-    .select("metric_key, agro_role");
-  if (rolesError) throw rolesError;
-
-  const roleByMetricKey = new Map((roleRows || []).map(r => [r.metric_key, r.agro_role]));
-
+async function computeAndUpsertAgroSummary(
+  supabase: ReturnType<typeof createAdminClient>,
+  dateStr: string,
+  roleByMetricKey: Map<string, string>
+) {
   // PostgREST caps rows per request (1000 by default) regardless of how many actually match -
   // a single selected day easily has 10000+ archived readings (10+ sensors x ~1 per minute), so
   // an unpaginated select here silently saw only the first page and, depending on row order,
@@ -189,16 +187,16 @@ async function computeAndUpsertAgroSummary(supabase: ReturnType<typeof createAdm
     byMetricKey.get(r.metric_key)!.push({ time: new Date(r.reading_time).getTime(), value: Number(r.value) });
   });
 
-  const climate: { [field: string]: number } = {};
-  const usedFields = new Set<string>();
+  // The agro role IS the climate field name now (homogenized vocabulary - see plan) - no
+  // role-to-field translation table needed anymore.
+  const climate: { [role: string]: number } = {};
+  const usedRoles = new Set<string>();
   byMetricKey.forEach((readings, metricKey) => {
     const role = roleByMetricKey.get(metricKey);
-    if (!role) return;
-    const field = ROLE_TO_CLIMATE_FIELD[role];
-    if (!field || usedFields.has(field)) return; // first tagged sensor wins, same as keysByRole()[0] client-side
+    if (!role || usedRoles.has(role)) return; // first tagged sensor wins, same as keysByRole()[0] client-side
     const avg = readings.reduce((sum, r) => sum + r.value, 0) / readings.length;
-    climate[field] = Number(avg.toFixed(3));
-    usedFields.add(field);
+    climate[role] = Number(avg.toFixed(3));
+    usedRoles.add(role);
   });
 
   let radiationSumJcm2: number | null = null;
@@ -278,6 +276,15 @@ export async function GET(req: NextRequest) {
     const metricKeys = Array.from(new Set((selected || []).map(r => r.metric_key)))
       .filter(k => ARANET_SENSOR_CATALOG[k]);
 
+    // Loaded once up front (not per-loop/per-summary) so every archived row - Aranet or Priva -
+    // can be tagged with its resolved agro_role at write time, homogenizing the raw archive
+    // itself instead of only resolving roles later at read time.
+    const { data: roleRows, error: rolesError } = await supabase
+      .from("aranet_metric_roles")
+      .select("metric_key, agro_role");
+    if (rolesError) throw rolesError;
+    const roleByMetricKey = new Map((roleRows || []).map(r => [r.metric_key, r.agro_role]));
+
     let totalArchived = 0;
     const errors: string[] = [];
 
@@ -311,7 +318,8 @@ export async function GET(req: NextRequest) {
           reading_time: new Date(timeMs).toISOString(),
           value,
           unit: defaultUnit,
-          archived_for_date: dateStr
+          archived_for_date: dateStr,
+          agro_role: roleByMetricKey.get(metricKey) || null
         }));
 
         // Chunk inserts to stay well under request size limits.
@@ -330,7 +338,7 @@ export async function GET(req: NextRequest) {
 
     let privaResult: any = null;
     try {
-      privaResult = await archivePrivaForDay(supabase, start, end, dateStr, daysAgo);
+      privaResult = await archivePrivaForDay(supabase, start, end, dateStr, daysAgo, roleByMetricKey);
     } catch (err: any) {
       console.error("Priva archive error:", err);
       privaResult = { skipped: true, reason: err.message || "Erreur d'archivage Priva." };
@@ -338,7 +346,7 @@ export async function GET(req: NextRequest) {
 
     let agroSummary: any = null;
     try {
-      agroSummary = await computeAndUpsertAgroSummary(supabase, dateStr);
+      agroSummary = await computeAndUpsertAgroSummary(supabase, dateStr, roleByMetricKey);
     } catch (err: any) {
       console.error("agro_daily_summary computation error:", err);
       agroSummary = { error: err.message || "Erreur de calcul du résumé agronomique." };

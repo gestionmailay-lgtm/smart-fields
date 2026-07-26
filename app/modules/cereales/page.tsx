@@ -6,7 +6,7 @@ import { ArrowLeft, ShoppingCart, TrendingUp, Droplets, Wheat, Fuel } from "luci
 import { Button } from "@/components/ui/button"
 
 export const metadata: Metadata = {
-  title: "Module Céréales - Rawwin",
+  title: "Module Céréales - Smart Fields",
   description: "Découvrez notre accompagnement pour les exploitations céréalières.",
 }
 

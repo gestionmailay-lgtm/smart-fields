@@ -94,7 +94,7 @@ export default function ConseilSerresPage() {
 
       if (error) {
         console.error("Erreur sauvegarde auto:", error)
-        toast.error("Échec de la synchronisation Raw'win")
+        toast.error("Échec de la synchronisation Smart Fields")
       }
     }, 1000)
 
@@ -123,7 +123,7 @@ export default function ConseilSerresPage() {
     <div className="container mx-auto p-6 md:p-12 max-w-7xl space-y-8">
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
-          <h2 className="text-3xl font-bold tracking-tight text-foreground">Conseil Raw'win : Pilotage Financier 5 ans</h2>
+          <h2 className="text-3xl font-bold tracking-tight text-foreground">Conseil Smart Fields : Pilotage Financier 5 ans</h2>
           <p className="text-muted-foreground mt-2 text-lg">
             Focus sur la cotation <strong>Gaz Légumes</strong> : Analyse trimestrielle et stratégie de couverture.
           </p>
@@ -199,7 +199,7 @@ export default function ConseilSerresPage() {
           </CardHeader>
           <CardContent>
             <p className="text-sm text-muted-foreground">
-              Raw'win conseille de conserver une flexibilité de 20% en spot. Cela permet d'absorber les baisses de consommation sans payer de pénalités de débouclage.
+              Smart Fields conseille de conserver une flexibilité de 20% en spot. Cela permet d'absorber les baisses de consommation sans payer de pénalités de débouclage.
             </p>
           </CardContent>
         </Card>

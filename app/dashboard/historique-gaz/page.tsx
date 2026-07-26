@@ -11,23 +11,23 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsToolti
 
 // Mock Data for 10 years
 const summaryData = [
-  { year: "2016", spot: 15.5, rawwin: 14.8 },
-  { year: "2017", spot: 18.0, rawwin: 16.5 },
-  { year: "2018", spot: 23.5, rawwin: 21.8 },
-  { year: "2019", spot: 14.2, rawwin: 13.9 },
-  { year: "2020", spot: 11.5, rawwin: 10.8 },
-  { year: "2021", spot: 47.0, rawwin: 32.5 },
-  { year: "2022", spot: 123.0, rawwin: 35.0 },
-  { year: "2023", spot: 42.0, rawwin: 36.5 },
-  { year: "2024", spot: 32.0, rawwin: 28.0 },
-  { year: "2025", spot: 30.0, rawwin: 26.5 },
+  { year: "2016", spot: 15.5, smart-fields: 14.8 },
+  { year: "2017", spot: 18.0, smart-fields: 16.5 },
+  { year: "2018", spot: 23.5, smart-fields: 21.8 },
+  { year: "2019", spot: 14.2, smart-fields: 13.9 },
+  { year: "2020", spot: 11.5, smart-fields: 10.8 },
+  { year: "2021", spot: 47.0, smart-fields: 32.5 },
+  { year: "2022", spot: 123.0, smart-fields: 35.0 },
+  { year: "2023", spot: 42.0, smart-fields: 36.5 },
+  { year: "2024", spot: 32.0, smart-fields: 28.0 },
+  { year: "2025", spot: 30.0, smart-fields: 26.5 },
 ]
 
 const detailedHistory = [
   {
     year: 2025,
     spotAvg: 30.0,
-    rawwinAvg: 26.5,
+    smart-fieldsAvg: 26.5,
     savings: "11.6%",
     quarters: [
       {
@@ -59,7 +59,7 @@ const detailedHistory = [
   {
     year: 2024,
     spotAvg: 32.0,
-    rawwinAvg: 28.0,
+    smart-fieldsAvg: 28.0,
     savings: "12.5%",
     quarters: [
       {
@@ -91,7 +91,7 @@ const detailedHistory = [
   {
     year: 2023,
     spotAvg: 42.0,
-    rawwinAvg: 36.5,
+    smart-fieldsAvg: 36.5,
     savings: "13.1%",
     quarters: [
       {
@@ -124,7 +124,7 @@ const detailedHistory = [
   {
     year: 2022,
     spotAvg: 123.0,
-    rawwinAvg: 35.0,
+    smart-fieldsAvg: 35.0,
     savings: "71.5%",
     quarters: [
       {
@@ -156,7 +156,7 @@ const detailedHistory = [
   {
     year: 2021,
     spotAvg: 47.0,
-    rawwinAvg: 32.5,
+    smart-fieldsAvg: 32.5,
     savings: "30.8%",
     quarters: [
       {
@@ -188,7 +188,7 @@ const detailedHistory = [
   {
     year: 2020,
     spotAvg: 11.5,
-    rawwinAvg: 10.8,
+    smart-fieldsAvg: 10.8,
     savings: "6.1%",
     quarters: [
       {
@@ -212,7 +212,7 @@ const detailedHistory = [
       {
         quarter: "Q4 2020",
         positions: [
-          { date: "05 Oct 2020", action: "Fixation Terme", volume: "100%", price: "13.5 €/MWh", rationale: "Premiers signaux de reprise industrielle en Asie captés par le réseau de données Raw'win. Fixation immédiate avant contagion haussière." },
+          { date: "05 Oct 2020", action: "Fixation Terme", volume: "100%", price: "13.5 €/MWh", rationale: "Premiers signaux de reprise industrielle en Asie captés par le réseau de données Smart Fields. Fixation immédiate avant contagion haussière." },
         ]
       }
     ]
@@ -220,7 +220,7 @@ const detailedHistory = [
   {
     year: 2019,
     spotAvg: 14.2,
-    rawwinAvg: 13.9,
+    smart-fieldsAvg: 13.9,
     savings: "2.1%",
     quarters: [
       {
@@ -252,7 +252,7 @@ const detailedHistory = [
   {
     year: 2018,
     spotAvg: 23.5,
-    rawwinAvg: 21.8,
+    smart-fieldsAvg: 21.8,
     savings: "7.2%",
     quarters: [
       {
@@ -284,7 +284,7 @@ const detailedHistory = [
   {
     year: 2017,
     spotAvg: 18.0,
-    rawwinAvg: 16.5,
+    smart-fieldsAvg: 16.5,
     savings: "8.3%",
     quarters: [
       {
@@ -316,7 +316,7 @@ const detailedHistory = [
   {
     year: 2016,
     spotAvg: 15.5,
-    rawwinAvg: 14.8,
+    smart-fieldsAvg: 14.8,
     savings: "4.5%",
     quarters: [
       {
@@ -429,7 +429,7 @@ export default function HistoriqueGazPage() {
               Performance Comparée (2016 - 2025)
             </CardTitle>
             <CardDescription className="text-base">
-              Comparatif entre le prix Spot moyen annuel et le prix obtenu via la stratégie Raw'win (en €/MWh).
+              Comparatif entre le prix Spot moyen annuel et le prix obtenu via la stratégie Smart Fields (en €/MWh).
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -441,7 +441,7 @@ export default function HistoriqueGazPage() {
                       <stop offset="5%" stopColor="#94a3b8" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#94a3b8" stopOpacity={0}/>
                     </linearGradient>
-                    <linearGradient id="colorRawwin" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="colorSmart Fields" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#f97316" stopOpacity={0.3}/>
                       <stop offset="95%" stopColor="#f97316" stopOpacity={0}/>
                     </linearGradient>
@@ -455,7 +455,7 @@ export default function HistoriqueGazPage() {
                   />
                   <Legend verticalAlign="top" height={36} iconType="circle" />
                   <Area type="monotone" name="Prix Spot Moyen" dataKey="spot" stroke="#94a3b8" strokeWidth={2} fillOpacity={1} fill="url(#colorSpot)" />
-                  <Area type="monotone" name="Stratégie Raw'win" dataKey="rawwin" stroke="#f97316" strokeWidth={3} fillOpacity={1} fill="url(#colorRawwin)" />
+                  <Area type="monotone" name="Stratégie Smart Fields" dataKey="smart-fields" stroke="#f97316" strokeWidth={3} fillOpacity={1} fill="url(#colorSmart Fields)" />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -487,7 +487,7 @@ export default function HistoriqueGazPage() {
                     <div>
                       <div className="flex items-center gap-3 mb-1">
                          <span className="text-sm text-slate-500">Spot: <strong className="text-slate-700">{yearData.spotAvg} €</strong></span>
-                         <span className="text-sm text-slate-500">Raw'win: <strong className="text-orange-600">{yearData.rawwinAvg} €</strong></span>
+                         <span className="text-sm text-slate-500">Smart Fields: <strong className="text-orange-600">{yearData.smart-fieldsAvg} €</strong></span>
                       </div>
                       <div className="flex items-center gap-2">
                          <Badge variant="outline" className="bg-green-100 text-green-700 hover:bg-green-100 border-none font-semibold">

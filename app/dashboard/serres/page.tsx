@@ -7,7 +7,7 @@ import { BacktestView } from "@/components/modules/serres/backtest-view"
 
 export const metadata: Metadata = {
   title: "Module Serres - Couverture Gaz",
-  description: "Backtesting de l'Agent IA Raw'win sur le marché du Gaz Naturel (PEG) et stratégie de couverture.",
+  description: "Backtesting de l'Agent IA Smart Fields sur le marché du Gaz Naturel (PEG) et stratégie de couverture.",
 }
 
 export default function SerresModulePage() {
@@ -26,7 +26,7 @@ export default function SerresModulePage() {
           
           <h1 className="text-5xl md:text-6xl font-black text-slate-900 tracking-tighter mb-6 leading-tight">
             Performances Historiques <br /> 
-            <span className="text-transparent bg-clip-text bg-gradient-to-r from-orange-500 to-amber-500">Agent IA Raw'win</span>
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-orange-500 to-amber-500">Agent IA Smart Fields</span>
           </h1>
           
           <p className="text-xl text-slate-600 font-medium max-w-3xl leading-relaxed mb-10">
@@ -36,7 +36,7 @@ export default function SerresModulePage() {
           <div className="flex gap-4">
             <Button asChild size="lg" className="rounded-full px-8 bg-orange-600 hover:bg-orange-700 h-14 text-base font-bold shadow-xl shadow-orange-600/20">
               <Link href="/dashboard/serres/conseil">
-                Accéder au Conseil Raw'win
+                Accéder au Conseil Smart Fields
                 <ArrowRight className="ml-2 w-5 h-5" />
               </Link>
             </Button>
@@ -49,7 +49,7 @@ export default function SerresModulePage() {
         <div className="mb-12 flex items-center justify-between">
           <div>
             <h2 className="text-3xl font-black text-slate-900 tracking-tight mb-4">Backtesting sur 10 ans (2015 - 2025)</h2>
-            <p className="text-slate-500 font-medium text-lg">Comparaison entre un achat "Spot" (au jour le jour) et un achat guidé par l'IA Raw'win.</p>
+            <p className="text-slate-500 font-medium text-lg">Comparaison entre un achat "Spot" (au jour le jour) et un achat guidé par l'IA Smart Fields.</p>
           </div>
           <div className="hidden md:flex p-4 bg-white rounded-2xl shadow-sm border border-slate-100 items-center gap-4">
              <div className="p-3 bg-green-100 text-green-700 rounded-full">
@@ -84,7 +84,7 @@ export default function SerresModulePage() {
 
             <Card className="border-none shadow-xl shadow-slate-200/50 rounded-[2rem] bg-white">
               <CardContent className="p-8">
-                <h3 className="text-slate-900 font-bold mb-6 text-lg">Principe du Conseil Raw'win</h3>
+                <h3 className="text-slate-900 font-bold mb-6 text-lg">Principe du Conseil Smart Fields</h3>
                 <ul className="space-y-4">
                   <li className="flex gap-3 items-start">
                     <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />

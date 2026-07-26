@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
-import { ROLE_TO_CLIMATE_FIELD, AGRO_TIME_SLOTS, isHourInSlot } from "@/lib/agroRoleMapping";
+import { AGRO_TIME_SLOTS, isHourInSlot } from "@/lib/agroRoleMapping";
 
 // Turns the raw Pearson coefficients from /api/agro-correlations into something a crop manager
 // can actually act on: for each factor AND each of the 5 agronomic time-of-day windows, the
@@ -26,16 +26,20 @@ function quantile(sorted: number[], q: number): number {
 async function fetchArchiveForDate(supabase: ReturnType<typeof createAdminClient>, dateStr: string) {
   // Same pagination fix as app/api/aranet/archive-daily/route.ts's computeAndUpsertAgroSummary -
   // a single day easily has 10000+ archived readings, well past PostgREST's default row cap.
-  const rows: { metric_key: string; reading_time: string; value: number }[] = [];
+  // Filters to agro_role is not null at the query level - archive-daily now tags every row with
+  // its resolved role at write time, so there's no need to separately load aranet_metric_roles
+  // and cross-reference metric_key -> role in memory here anymore.
+  const rows: { reading_time: string; value: number; agro_role: string }[] = [];
   for (let from = 0; ; from += ARCHIVE_PAGE_SIZE) {
     const { data: page, error } = await supabase
       .from("aranet_daily_archive")
-      .select("metric_key, reading_time, value")
+      .select("reading_time, value, agro_role")
       .eq("archived_for_date", dateStr)
+      .not("agro_role", "is", null)
       .range(from, from + ARCHIVE_PAGE_SIZE - 1);
     if (error) throw error;
     if (!page || page.length === 0) break;
-    rows.push(...page);
+    rows.push(...(page as any));
     if (page.length < ARCHIVE_PAGE_SIZE) break;
   }
   return rows;
@@ -62,41 +66,32 @@ export async function GET() {
     const topCount = Math.max(3, Math.round(ranked.length * TOP_SHARE));
     const topDates = ranked.slice(0, topCount).map(r => r.date);
 
-    const { data: roleRows, error: rolesError } = await supabase
-      .from("aranet_metric_roles")
-      .select("metric_key, agro_role");
-    if (rolesError) throw rolesError;
-    const roleByMetricKey = new Map((roleRows || []).map(r => [r.metric_key, r.agro_role]));
-
-    // slotValues[field][slotLabel] = one averaged value per top day that had readings for that
-    // field during that slot - the population the IQR target range is drawn from.
-    const slotValues: { [field: string]: { [slotLabel: string]: number[] } } = {};
+    // slotValues[role][slotLabel] = one averaged value per top day that had readings for that
+    // role during that slot - the population the IQR target range is drawn from.
+    const slotValues: { [role: string]: { [slotLabel: string]: number[] } } = {};
 
     for (const dateStr of topDates) {
       const archiveRows = await fetchArchiveForDate(supabase, dateStr);
       if (archiveRows.length === 0) continue;
 
-      const byMetricKey = new Map<string, { hour: number; value: number }[]>();
+      const byRole = new Map<string, { hour: number; value: number }[]>();
       archiveRows.forEach(r => {
-        const role = roleByMetricKey.get(r.metric_key);
-        const field = role ? ROLE_TO_CLIMATE_FIELD[role] : undefined;
-        if (!field) return;
-        if (!byMetricKey.has(field)) byMetricKey.set(field, []);
+        if (!byRole.has(r.agro_role)) byRole.set(r.agro_role, []);
         // Local hour, not UTC - matches getStatsForTimeRange's semantics client-side
         // (app/dashboard/aranet/page.tsx) and getDayBounds' local-time day boundaries in
         // app/api/aranet/archive-daily/route.ts, both of which treat the server/browser's local
         // timezone as the greenhouse's timezone.
-        byMetricKey.get(field)!.push({ hour: new Date(r.reading_time).getHours(), value: Number(r.value) });
+        byRole.get(r.agro_role)!.push({ hour: new Date(r.reading_time).getHours(), value: Number(r.value) });
       });
 
-      byMetricKey.forEach((readings, field) => {
+      byRole.forEach((readings, role) => {
         AGRO_TIME_SLOTS.forEach(slot => {
           const inSlot = readings.filter(r => isHourInSlot(r.hour, slot.start, slot.end));
           if (inSlot.length === 0) return;
           const avg = inSlot.reduce((s, r) => s + r.value, 0) / inSlot.length;
-          if (!slotValues[field]) slotValues[field] = {};
-          if (!slotValues[field][slot.label]) slotValues[field][slot.label] = [];
-          slotValues[field][slot.label].push(avg);
+          if (!slotValues[role]) slotValues[role] = {};
+          if (!slotValues[role][slot.label]) slotValues[role][slot.label] = [];
+          slotValues[role][slot.label].push(avg);
         });
       });
     }

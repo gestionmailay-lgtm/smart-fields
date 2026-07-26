@@ -1,4 +1,4 @@
--- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Rawwin project.
+-- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Smart Fields project.
 -- Purpose: daily 1-minute-resolution archive of the Aranet sensors currently selected in the
 -- Climat/Croissance and Ferti Irrigation tabs, so historical data survives even if Aranet's
 -- API rate limits or retention window would otherwise cause it to be lost.

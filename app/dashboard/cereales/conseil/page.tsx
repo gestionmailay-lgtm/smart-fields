@@ -125,7 +125,7 @@ export default function ConseilCerealesPage() {
       <div className="mb-12 flex justify-between items-center border-b border-slate-100 pb-8">
           <div>
             <h2 className="text-4xl font-black tracking-tighter text-slate-900 uppercase">
-                Conseil <span className="text-amber-600 italic">Raw'win</span>
+                Conseil <span className="text-amber-600 italic">Smart Fields</span>
             </h2>
             <p className="text-slate-500 font-medium text-lg mt-2">
                 Stratégie de couverture Achats & Ventes pour sécuriser votre Marge.
@@ -147,7 +147,7 @@ export default function ConseilCerealesPage() {
               
               <Alert className="bg-amber-50 border-amber-200 text-amber-900 rounded-[1.5rem]">
                 <Sparkles className="h-5 w-5 text-amber-600" />
-                <AlertTitle className="font-bold text-amber-800">Conseil IA Raw'win</AlertTitle>
+                <AlertTitle className="font-bold text-amber-800">Conseil IA Smart Fields</AlertTitle>
                 <AlertDescription className="mt-2 text-sm leading-relaxed">
                   Au vu de la volatilité actuelle, nous conseillons de sécuriser <strong>70% de vos besoins</strong> totaux en Engrais et en GNR avant le début de la campagne pour limiter l'exposition au marché spot.
                 </AlertDescription>

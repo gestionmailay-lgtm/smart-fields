@@ -1,25 +1,39 @@
-// Human-readable French labels for the factor keys used across the agronomic agent: the
-// climate jsonb fields in agro_daily_summary (same keys as the aiContext object built in
-// app/dashboard/aranet/page.tsx's dynamicAgronomicData), plus the top-level radiation_sum_jcm2
-// factor from /api/agro-correlations. Shared between the client (Corrélations apprises panel)
-// and the server (agro-ai-analysis prompt) so both show the same names instead of raw keys like
-// "radiation_sum_jcm2" or "tempAvg". Mirrors the wording already used in the "Rôle Agronomique"
-// dropdown (app/dashboard/aranet/page.tsx) so the same concept always reads the same way.
+// Human-readable French labels for the factor keys used across the agronomic agent. Since the
+// homogenization pass, the `climate` jsonb in agro_daily_summary (and everywhere derived from
+// it - correlations, target ranges, the AI prompt) is keyed directly by agro role slug
+// (temp_serre, ec_pain, humidite_pain...) - the same vocabulary as the "Rôle Agronomique"
+// dropdown and aranet_daily_archive.agro_role. There's exactly one vocabulary now, not two kept
+// in sync by hand (a mismatch here is what caused a real bug earlier: humidite_pain was wired
+// server-side but missing client-side).
+//
+// The map below is only a FALLBACK for when the live agro_roles catalog (fetched via
+// /api/agro-roles, see app/dashboard/aranet/page.tsx's agroRoleLabels) hasn't loaded yet, or for
+// keys that aren't roles at all (radiation_sum_jcm2 is a top-level agro_daily_summary column, not
+// a climate role key; the day/night-split fields are ad-hoc refinements, see the plan's scope
+// note) - the DB catalog is the source of truth and always takes priority when provided.
 export const AGRO_FACTOR_LABELS: { [factorKey: string]: string } = {
   radiation_sum_jcm2: "Somme de radiation",
-  tempAvg: "T°C serre",
-  tempOutAvg: "T°C extérieure",
-  vpdAvg: "VPD Haut",
-  rhAvg: "HR serre",
-  wcAvg: "Humidité du pain",
-  ecAvg: "EC pain",
-  radAvg: "Radiation instantanée",
-  windAvg: "Vitesse du vent",
-  co2Avg: "CO2",
-  rainAvg: "Pluie",
-  slabWeightAvg: "Poids du pain",
-  substrateTempAvg: "T°C pain",
-  waterConsumptionAvg: "Consommation d'eau",
+  temp_serre: "T°C serre",
+  temp_exterieure: "T°C extérieure",
+  vpd_haut: "VPD Haut",
+  hr_serre: "HR serre",
+  hr_exterieure: "HR extérieure",
+  humidite_pain: "Humidité du pain",
+  ec_pain: "EC pain",
+  radiation_instantanee: "Radiation instantanée",
+  vitesse_vent: "Vitesse du vent",
+  co2: "CO2",
+  pluie: "Pluie",
+  poids_pain: "Poids du pain",
+  temp_pain: "T°C pain",
+  consommation_eau: "Consommation d'eau",
+  gain_cumule: "Gain cumulé",
+  poids_total_plante: "Poids total de plante",
+  gros_tuyau: "Gros tuyau",
+  position_chassis_abrite: "Position chassis abrité",
+  position_chassis_expose: "Position chassis exposé",
+  forecast: "Forecas",
+  // Day/night-split refinements (see plan scope note) - not first-class roles, kept as-is.
   co2DayAvg: "CO2 (jour)",
   co2NightAvg: "CO2 (nuit)",
   co2DayTrend: "Tendance CO2 (jour)",
@@ -30,10 +44,11 @@ export const AGRO_FACTOR_LABELS: { [factorKey: string]: string } = {
 };
 
 // Strips the "_lag1" (previous-day) suffix used by /api/agro-correlations before lookup, and
-// appends "(jour précédent)" to the resolved label instead of the raw key.
-export function formatAgroFactorLabel(factorKey: string): string {
+// appends "(jour précédent)" to the resolved label instead of the raw key. `labelsByKey`, when
+// provided, is the live agro_roles catalog and takes priority over the static fallback above.
+export function formatAgroFactorLabel(factorKey: string, labelsByKey?: { [key: string]: string }): string {
   const isLag = factorKey.endsWith("_lag1");
   const baseKey = isLag ? factorKey.slice(0, -"_lag1".length) : factorKey;
-  const label = AGRO_FACTOR_LABELS[baseKey] || baseKey;
+  const label = labelsByKey?.[baseKey] || AGRO_FACTOR_LABELS[baseKey] || baseKey;
   return isLag ? `${label} (jour précédent)` : label;
 }

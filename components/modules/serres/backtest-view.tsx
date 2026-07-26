@@ -56,7 +56,7 @@ export function BacktestView() {
                 />
                 <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
                 <Line type="monotone" name="Spot PEG Moyen" dataKey="spot" stroke="#cbd5e1" strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} />
-                <Line type="monotone" name="Couverture Raw'win" dataKey="rawWin" stroke="#f97316" strokeWidth={4} dot={{ r: 5, strokeWidth: 2 }} activeDot={{ r: 7 }} />
+                <Line type="monotone" name="Couverture Smart Fields" dataKey="rawWin" stroke="#f97316" strokeWidth={4} dot={{ r: 5, strokeWidth: 2 }} activeDot={{ r: 7 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -72,7 +72,7 @@ export function BacktestView() {
             <DialogTrigger asChild>
               <Button variant="outline" className="rounded-full border-orange-200 text-orange-700 bg-orange-50 hover:bg-orange-100 hover:text-orange-800">
                 <Info className="w-4 h-4 mr-2" />
-                Comprendre la stratégie Raw'win (Historique des positions)
+                Comprendre la stratégie Smart Fields (Historique des positions)
               </Button>
             </DialogTrigger>
             <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto rounded-[2rem]">
@@ -114,7 +114,7 @@ export function BacktestView() {
                 <tr>
                   <th className="px-6 py-4">Année</th>
                   <th className="px-6 py-4">Spot PEG (€/MWh)</th>
-                  <th className="px-6 py-4">Raw'win (€/MWh)</th>
+                  <th className="px-6 py-4">Smart Fields (€/MWh)</th>
                   <th className="px-6 py-4">Économie Générée</th>
                 </tr>
               </thead>

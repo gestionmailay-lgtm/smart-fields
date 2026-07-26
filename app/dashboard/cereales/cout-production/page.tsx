@@ -300,7 +300,7 @@ export default function CoutProductionCerealesPage() {
               disabled={saving}
               className="rounded-full h-16 px-12 text-lg font-black uppercase tracking-widest bg-amber-600 hover:bg-amber-700 text-white shadow-xl shadow-amber-600/30"
           >
-              {saving ? "Sauvegarde..." : "Valider & Consulter la Stratégie Raw'win"} <ArrowRight className="ml-3 h-6 w-6" />
+              {saving ? "Sauvegarde..." : "Valider & Consulter la Stratégie Smart Fields"} <ArrowRight className="ml-3 h-6 w-6" />
           </Button>
       </div>
 

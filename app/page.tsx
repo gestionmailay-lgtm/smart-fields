@@ -22,7 +22,7 @@ export default async function Home() {
           <Link href="/" className="hover:opacity-90 transition-opacity">
             <Image
               src="/logo.png"
-              alt="Rawwin Logo"
+              alt="Smart Fields Logo"
               width={180}
               height={60}
               className="h-12 w-auto object-contain rounded-xl overflow-hidden"
@@ -75,7 +75,7 @@ export default async function Home() {
         <section className="w-full relative aspect-[21/9] md:aspect-[3/1] max-h-[600px] overflow-hidden shadow-inner">
           <Image
             src="/landing-infographic.png"
-            alt="Dashboard Infographie Rawwin"
+            alt="Dashboard Infographie Smart Fields"
             fill
             className="object-cover md:object-contain bg-muted/30"
             priority

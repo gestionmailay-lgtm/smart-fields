@@ -1,4 +1,4 @@
--- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Rawwin project.
+-- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Smart Fields project.
 -- Purpose: mirrors the currently-selected Priva sensors (fixed or custom catalog points) into
 -- Supabase, so the daily archive cron - which has no access to browser state - knows which
 -- variableId/deviceId to query on Priva's API and archive into aranet_daily_archive, the same

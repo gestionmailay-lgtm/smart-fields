@@ -81,7 +81,7 @@ export default function SerresLayout({
               </div>
             </div>
 
-            {/* Colonne Centrale : Conseil Raw'win (Flashy) */}
+            {/* Colonne Centrale : Conseil Smart Fields (Flashy) */}
             <div className="relative h-full">
               <Link 
                 href="/dashboard/serres/conseil"

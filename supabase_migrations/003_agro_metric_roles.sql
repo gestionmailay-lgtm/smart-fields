@@ -1,4 +1,4 @@
--- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Rawwin project.
+-- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Smart Fields project.
 -- Purpose: mirrors each Aranet sensor's "Rôle Agronomique" tag (metricConfigs[key].agroRole in
 -- app/dashboard/aranet/page.tsx) into Supabase, so the daily archive cron job - which has no
 -- access to browser state - knows which archived sensor is "temperature serre", "radiation

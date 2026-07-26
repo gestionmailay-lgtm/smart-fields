@@ -7,7 +7,7 @@ import { BacktestView } from "@/components/modules/cereales/backtest-view"
 
 export const metadata: Metadata = {
   title: "Module Céréales - Couverture MATIF",
-  description: "Backtesting de l'Agent IA Raw'win sur les marchés Blé, Colza et GNR.",
+  description: "Backtesting de l'Agent IA Smart Fields sur les marchés Blé, Colza et GNR.",
 }
 
 export default function CerealesModulePage() {
@@ -26,7 +26,7 @@ export default function CerealesModulePage() {
           
           <h1 className="text-5xl md:text-6xl font-black text-slate-900 tracking-tighter mb-6 leading-tight">
             Performances Historiques <br /> 
-            <span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-500 to-yellow-500">Agent IA Raw'win</span>
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-500 to-yellow-500">Agent IA Smart Fields</span>
           </h1>
           
           <p className="text-xl text-slate-600 font-medium max-w-3xl leading-relaxed mb-10">
@@ -84,7 +84,7 @@ export default function CerealesModulePage() {
 
             <Card className="border-none shadow-xl shadow-slate-200/50 rounded-[2rem] bg-white">
               <CardContent className="p-8">
-                <h3 className="text-slate-900 font-bold mb-6 text-lg">Principe du Conseil Raw'win</h3>
+                <h3 className="text-slate-900 font-bold mb-6 text-lg">Principe du Conseil Smart Fields</h3>
                 <ul className="space-y-4">
                   <li className="flex gap-3 items-start">
                     <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />

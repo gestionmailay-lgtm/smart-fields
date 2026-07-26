@@ -33,7 +33,8 @@ import {
   Gauge,
   Lightbulb,
   ShieldAlert,
-  Droplets
+  Droplets,
+  Tag
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { 
@@ -905,6 +906,40 @@ export default function AranetUnifiedDashboard() {
   // correlations above into an actionable value to aim for, and lets dynamicAgronomicData flag
   // which factor was outside its slot-specific range (and therefore likely limiting) per slot.
   const [agroTargetRanges, setAgroTargetRanges] = useState<{ [factorKey: string]: { [slotLabel: string]: { min: number; max: number; sampleSize: number } } }>({});
+
+  // Admin-managed role catalog (agro_roles, see app/dashboard/aranet/roles/page.tsx) - source of
+  // truth for the "Rôle Agronomique" dropdown options and for display labels everywhere the
+  // agent shows a factor name (Corrélations apprises, facteur limitant par créneau). Replaces
+  // the hardcoded <option> list that used to live directly in this file.
+  const [agroRoles, setAgroRoles] = useState<{ role_key: string; label: string; category: string }[]>([]);
+  const agroRolesByCategory = useMemo(() => {
+    const grouped: { [category: string]: { role_key: string; label: string }[] } = {};
+    agroRoles.forEach(r => {
+      if (!grouped[r.category]) grouped[r.category] = [];
+      grouped[r.category].push({ role_key: r.role_key, label: r.label });
+    });
+    return grouped;
+  }, [agroRoles]);
+  const agroRoleLabels = useMemo(() => {
+    const map: { [roleKey: string]: string } = {};
+    agroRoles.forEach(r => { map[r.role_key] = r.label; });
+    return map;
+  }, [agroRoles]);
+
+  const fetchAgroRoles = async () => {
+    try {
+      const res = await fetch("/api/agro-roles");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erreur de chargement des rôles.");
+      setAgroRoles(data.roles || []);
+    } catch (e) {
+      console.error("Failed to fetch agro roles:", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchAgroRoles();
+  }, []);
 
   const fetchPrivaData = async () => {
     setPrivaLoading(true);
@@ -2911,16 +2946,16 @@ export default function AranetUnifiedDashboard() {
       // amount of lost gain (cumulative gain has no hourly ground truth from a scale reading
       // alone) - it flags where conditions deviated from the proven-good range.
       const slotFactorKeys: { field: string; key: string | undefined }[] = [
-        { field: "tempAvg", key: tempKeys[0] },
-        { field: "tempOutAvg", key: tempOutKeys[0] },
-        { field: "vpdAvg", key: vpdKeys[0] },
-        { field: "rhAvg", key: rhKeys[0] },
-        { field: "wcAvg", key: wcKeys[0] },
-        { field: "ecAvg", key: ecKeys[0] },
-        { field: "radAvg", key: radKeys[0] },
-        { field: "windAvg", key: windKeys[0] },
-        { field: "co2Avg", key: co2Keys[0] },
-        { field: "rainAvg", key: rainKeys[0] }
+        { field: "temp_serre", key: tempKeys[0] },
+        { field: "temp_exterieure", key: tempOutKeys[0] },
+        { field: "vpd_haut", key: vpdKeys[0] },
+        { field: "hr_serre", key: rhKeys[0] },
+        { field: "humidite_pain", key: wcKeys[0] },
+        { field: "ec_pain", key: ecKeys[0] },
+        { field: "radiation_instantanee", key: radKeys[0] },
+        { field: "vitesse_vent", key: windKeys[0] },
+        { field: "co2", key: co2Keys[0] },
+        { field: "pluie", key: rainKeys[0] }
       ];
       const limitingFactorsBySlot = AGRO_TIME_SLOTS.map(slot => {
         let worst: { field: string; value: number; range: { min: number; max: number }; deviation: number } | null = null;
@@ -2970,9 +3005,24 @@ export default function AranetUnifiedDashboard() {
         actionPlan: actionPlans,
         // Climate stats + drops bundled up for the AI black-box call, so the request payload
         // doesn't need to be re-derived from chartData/rawDataMap on every "Analyser avec l'IA" click.
+        // Keyed by agro role slug, not an ad-hoc English name - the same vocabulary as the
+        // "Rôle Agronomique" dropdown, aranet_daily_archive.agro_role and computeAndUpsertAgroSummary
+        // (app/api/aranet/archive-daily/route.ts), so the browser-sync path and the cron path
+        // write the identical vocabulary into agro_daily_summary.climate.
         aiContext: {
-          tempAvg, tempOutAvg, vpdAvg, rhAvg, wcAvg, ecAvg, radAvg, windAvg, co2Avg, rainAvg,
-          slabWeightAvg, substrateTempAvg, waterConsumptionAvg,
+          temp_serre: tempAvg,
+          temp_exterieure: tempOutAvg,
+          vpd_haut: vpdAvg,
+          hr_serre: rhAvg,
+          humidite_pain: wcAvg,
+          ec_pain: ecAvg,
+          radiation_instantanee: radAvg,
+          vitesse_vent: windAvg,
+          co2: co2Avg,
+          pluie: rainAvg,
+          poids_pain: slabWeightAvg,
+          temp_pain: substrateTempAvg,
+          consommation_eau: waterConsumptionAvg,
           // Day/night split and intra-day trend, not just the flat 24h figures above - a 24h
           // average hides exactly the kind of thing that actually explains growth outcomes
           // (CO2 depleting over the day, a chassis briefly wide open at midday, etc.).
@@ -3539,33 +3589,13 @@ export default function AranetUnifiedDashboard() {
                 className="text-[9px] border rounded bg-background p-0.5 focus:outline-none focus:ring-1 focus:ring-primary h-5 cursor-pointer max-w-[130px] font-bold text-foreground"
               >
                 <option value="none">Aucun (Auto)</option>
-                <optgroup label="Climat / Croissance">
-                  <option value="co2">CO2</option>
-                  <option value="forecast">Forecas</option>
-                  <option value="gros_tuyau">Gros tuyau</option>
-                  <option value="hr_exterieure">HR extérieure</option>
-                  <option value="hr_serre">HR serre</option>
-                  <option value="pluie">Pluie</option>
-                  <option value="position_chassis_abrite">Position chassis abrité</option>
-                  <option value="position_chassis_expose">Position chassis exposé</option>
-                  <option value="radiation_instantanee">Radiation instantannée</option>
-                  <option value="radiation_sum">Somme de radiation</option>
-                  <option value="temp_exterieure">T°C extérieure</option>
-                  <option value="temp_serre">T°C serre</option>
-                  <option value="vitesse_vent">Vitesse du vent</option>
-                  <option value="vpd_haut">VPD Haut</option>
-                </optgroup>
-                <optgroup label="Physiologie">
-                  <option value="gain_cumule">Gain cumulé</option>
-                  <option value="poids_total_plante">Poids total de plante</option>
-                </optgroup>
-                <optgroup label="Ferti Irrigation">
-                  <option value="ec_pain">EC pain</option>
-                  <option value="poids_pain">Poids du pain</option>
-                  <option value="consommation_eau">Consommation d&apos;eau</option>
-                  <option value="temp_pain">T°C pain</option>
-                  <option value="humidite_pain">Humidité du pain</option>
-                </optgroup>
+                {Object.entries(agroRolesByCategory).map(([category, roles]) => (
+                  <optgroup key={category} label={category}>
+                    {roles.map(role => (
+                      <option key={role.role_key} value={role.role_key}>{role.label}</option>
+                    ))}
+                  </optgroup>
+                ))}
               </select>
             </div>
           </div>
@@ -3734,6 +3764,16 @@ export default function AranetUnifiedDashboard() {
               <option value="6">Compartiment 6 (Priva)</option>
             </select>
           </div>
+
+          {/* Link to the role catalog admin screen (app/dashboard/aranet/roles) - an icon, not a
+              tab, same "not a destination like the others" treatment as the Compartiment filter. */}
+          <Link
+            href="/dashboard/aranet/roles"
+            title="Rôles Agronomiques"
+            className="flex items-center justify-center h-8 w-8 rounded-full bg-muted/40 border border-muted/20 text-muted-foreground hover:text-primary hover:border-primary/30 transition-colors"
+          >
+            <Tag className="h-3.5 w-3.5" />
+          </Link>
 
           {activeTab === "charts" && (
             <Button variant="ghost" size="icon" onClick={fetchActiveData} disabled={loading} className="h-8 w-8">
@@ -5348,7 +5388,7 @@ export default function AranetUnifiedDashboard() {
                       </div>
                     ) : (
                       agroCorrelations.slice(0, 12).map((c: any) => {
-                        const label = formatAgroFactorLabel(c.factor_key);
+                        const label = formatAgroFactorLabel(c.factor_key, agroRoleLabels);
                         const abs = Math.abs(c.coefficient);
                         const strength = abs >= 0.5 ? "text-emerald-600" : abs >= 0.3 ? "text-amber-600" : "text-muted-foreground";
                         return (
@@ -5721,7 +5761,7 @@ export default function AranetUnifiedDashboard() {
                                         <p className="text-[9px] font-black uppercase text-muted-foreground tracking-wider">{slot.label}</p>
                                         {slot.limitingFactor ? (
                                           <>
-                                            <p className="text-[11px] font-black text-rose-600 mt-1 truncate">{formatAgroFactorLabel(slot.limitingFactor.field)}</p>
+                                            <p className="text-[11px] font-black text-rose-600 mt-1 truncate">{formatAgroFactorLabel(slot.limitingFactor.field, agroRoleLabels)}</p>
                                             <p className="text-[9px] text-muted-foreground font-semibold">{slot.limitingFactor.value} (cible {slot.limitingFactor.range.min}–{slot.limitingFactor.range.max})</p>
                                           </>
                                         ) : (

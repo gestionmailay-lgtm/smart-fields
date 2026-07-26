@@ -6,7 +6,7 @@ import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
 
 export const metadata: Metadata = {
-  title: "Module Porc - Rawwin",
+  title: "Module Porc - Smart Fields",
   description: "Découvrez notre accompagnement pour l'élevage porcin.",
 }
 

@@ -19,6 +19,13 @@ import { formatAgroFactorLabel } from "@/lib/agroFactorLabels";
 const TOP_CORRELATIONS_LIMIT = 6;
 const TOP_LITERATURE_CHUNKS = 6;
 
+async function fetchRoleLabels(supabase: ReturnType<typeof createAdminClient>) {
+  const { data } = await supabase.from("agro_roles").select("role_key, label");
+  const map: { [roleKey: string]: string } = {};
+  (data || []).forEach(r => { map[r.role_key] = r.label; });
+  return map;
+}
+
 async function fetchTopCorrelations(supabase: ReturnType<typeof createAdminClient>) {
   const { data } = await supabase
     .from("agro_correlations")
@@ -88,13 +95,14 @@ export async function POST(req: NextRequest) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const supabase = createAdminClient();
 
-    const [correlations, literatureChunks] = await Promise.all([
+    const [correlations, literatureChunks, roleLabels] = await Promise.all([
       fetchTopCorrelations(supabase),
       fetchRelevantLiterature(
         supabase,
         genAI,
         `Facteurs climatiques et de substrat limitant le gain de croissance de la tomate en serre chauffée ce jour-là : ${JSON.stringify(climate)}. Écarts détectés : ${JSON.stringify(ruleBasedFindings)}.`
-      )
+      ),
+      fetchRoleLabels(supabase)
     ]);
 
     const model = genAI.getGenerativeModel({
@@ -107,7 +115,7 @@ export async function POST(req: NextRequest) {
 
     const correlationsBlock = correlations.length > 0
       ? correlations.map((c: any) => {
-          const label = formatAgroFactorLabel(c.factor_key);
+          const label = formatAgroFactorLabel(c.factor_key, roleLabels);
           return `- ${label} : r=${Number(c.coefficient).toFixed(2)} (n=${c.sample_size} jours)`;
         }).join("\n")
       : "Aucune corrélation encore disponible (historique insuffisant - moins de 10 jours de résumés enregistrés pour cette serre à ce stade).";

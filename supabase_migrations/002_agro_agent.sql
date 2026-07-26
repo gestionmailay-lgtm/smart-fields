@@ -1,4 +1,4 @@
--- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Rawwin project.
+-- Run this once in the Supabase SQL editor (Project > SQL Editor) for the Smart Fields project.
 -- Purpose: persistent backbone for the agronomic AI agent - a growing history of daily
 -- growth/climate summaries, statistical correlations computed on that history, and a
 -- bibliographic knowledge base (uploaded literature, chunked + embedded) so the agent's

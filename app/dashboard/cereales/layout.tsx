@@ -79,7 +79,7 @@ export default function CerealesLayout({
               </div>
             </div>
 
-            {/* Étape 3 : Conseil Raw'win (Flashy) */}
+            {/* Étape 3 : Conseil Smart Fields (Flashy) */}
             <div className="relative h-full">
               <Link 
                 href="/dashboard/cereales/conseil"

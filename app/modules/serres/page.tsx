@@ -6,7 +6,7 @@ import { ArrowLeft, ShoppingCart, Droplets, Fuel } from "lucide-react"
 import { Button } from "@/components/ui/button"
 
 export const metadata: Metadata = {
-  title: "Module Serres - Rawwin",
+  title: "Module Serres - Smart Fields",
   description: "Découvrez notre accompagnement pour les exploitations sous serres.",
 }
 

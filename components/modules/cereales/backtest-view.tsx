@@ -56,7 +56,7 @@ export function BacktestView() {
                 />
                 <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
                 <Line type="monotone" name="Spot GNR Moyen" dataKey="spot" stroke="#cbd5e1" strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} />
-                <Line type="monotone" name="Couverture Raw'win" dataKey="rawWin" stroke="#f59e0b" strokeWidth={4} dot={{ r: 5, strokeWidth: 2 }} activeDot={{ r: 7 }} />
+                <Line type="monotone" name="Couverture Smart Fields" dataKey="rawWin" stroke="#f59e0b" strokeWidth={4} dot={{ r: 5, strokeWidth: 2 }} activeDot={{ r: 7 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -72,7 +72,7 @@ export function BacktestView() {
             <DialogTrigger asChild>
               <Button variant="outline" className="rounded-full border-amber-200 text-amber-700 bg-amber-50 hover:bg-amber-100 hover:text-amber-800">
                 <Info className="w-4 h-4 mr-2" />
-                Comprendre la stratégie Raw'win (Historique des positions)
+                Comprendre la stratégie Smart Fields (Historique des positions)
               </Button>
             </DialogTrigger>
             <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto rounded-[2rem]">
@@ -114,7 +114,7 @@ export function BacktestView() {
                 <tr>
                   <th className="px-6 py-4">Année</th>
                   <th className="px-6 py-4">Spot GNR (€/L)</th>
-                  <th className="px-6 py-4">Raw'win (€/L)</th>
+                  <th className="px-6 py-4">Smart Fields (€/L)</th>
                   <th className="px-6 py-4">Économie Générée</th>
                 </tr>
               </thead>
