@@ -36,6 +36,11 @@ yarn-error.log*
 # vercel
 .vercel
 
+# agronomic literature PDFs (copyrighted reference material - never committed, only ingested
+# locally via `npm run ingest:agro-literature`, see agro-literature-docs/README.md)
+/agro-literature-docs/*
+!/agro-literature-docs/README.md
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

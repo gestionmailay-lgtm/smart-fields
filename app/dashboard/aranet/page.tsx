@@ -3,6 +3,8 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import Link from "next/link";
 import Image from "next/image";
+import { formatAgroFactorLabel } from "@/lib/agroFactorLabels";
+import { AGRO_TIME_SLOTS } from "@/lib/agroRoleMapping";
 import { 
   Card, 
   CardContent, 
@@ -22,7 +24,6 @@ import {
   Square,
   Sparkles,
   Menu,
-  Leaf,
   Award,
   TrendingUp,
   TrendingDown,
@@ -30,16 +31,9 @@ import {
   AlertTriangle,
   Info,
   Gauge,
-  Thermometer,
-  Maximize2,
   Lightbulb,
   ShieldAlert,
-  Cpu,
-  Droplets,
-  Sun,
-  Wind,
-  Flame,
-  Search
+  Droplets
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { 
@@ -164,6 +158,11 @@ const METRIC_BADGES: { [key: string]: string } = {
   priva_c6_hum: "C6.H"
 };
 
+// Default sensor set for the "Ferti Irrigation" tab on first load - kept independent from the
+// main Climat/Croissance sensor selection so it never crowds/conflicts with that chart. Any
+// other Aranet or Priva sensor can be added on top of this from the tab's own picker.
+const FERTI_METRIC_KEYS = ["slab_ec_wc_8", "slab_ec_wc_11", "slab_ec_wc_10", "slab_ec_wc_1", "slab_weight_7"];
+
 function safeSetSessionStorage(key: string, value: string) {
   try {
     sessionStorage.setItem(key, value);
@@ -221,6 +220,344 @@ function normalizeDateKey(key: string): string {
   return key;
 }
 
+// A single drop is identified by the day it falls on plus its HH:MM, so several
+// independent drops on the same day never collide or overwrite one another.
+function getDropId(dateStr: string, timeStr: string): string {
+  return `${dateStr}__${timeStr}`;
+}
+
+function parseDropId(dropId: string): { dateStr: string; timeStr: string } {
+  const idx = dropId.indexOf("__");
+  if (idx === -1) return { dateStr: dropId, timeStr: "" };
+  return { dateStr: dropId.slice(0, idx), timeStr: dropId.slice(idx + 2) };
+}
+
+type WeightDropCandidate = {
+  id: string;
+  dateStr: string;
+  timeStr: string;
+  time: number;
+  direction: "drop" | "rise"; // brutal decrease or brutal increase of raw scale weight
+  suddenDropVal: number; // grams/m², positive magnitude regardless of direction
+  suggestedCorrectionGrams: number; // positive magnitude; sign to apply depends on direction
+  autoEventType: "harvest" | "thinning" | "descent" | "recalibration" | "watering"; // best-guess characterization, always computed, purely informative
+};
+
+// Best-effort, purely informative characterization of a detected weight movement. Never gates
+// whether the correction is applied (every detected movement is auto-smoothed) - it only picks
+// a sensible default label the user can see/override in the UI.
+function guessMovementEventType(direction: "drop" | "rise", magnitudeGramsPerM2: number): "harvest" | "thinning" | "descent" | "recalibration" | "watering" {
+  if (direction === "drop") {
+    if (magnitudeGramsPerM2 > 300) return "harvest";
+    if (magnitudeGramsPerM2 > 80) return "thinning";
+    return "descent";
+  }
+  if (magnitudeGramsPerM2 > 150) return "recalibration";
+  return "watering";
+}
+
+// Detects every unexplained brutal weight movement (drop OR rise) across the whole (continuous,
+// cross-midnight-safe) series, rather than a single per-day maximum. Uses a sliding-window
+// comparison instead of adjacent-point deltas (so movements spread over a few minutes aren't
+// missed), and an adaptive threshold derived from the scale's own recent noise level (median
+// absolute deviation) so a noisier scale doesn't trigger false positives while a very clean one
+// still catches small, real movements instead of requiring a fixed 15g cut-off.
+function detectWeightMovements(
+  rows: any[],
+  key: string,
+  divisor: number,
+  multiplier: number
+): WeightDropCandidate[] {
+  const rawKey = `${key}_raw`;
+  const readings = rows
+    .filter(r => r.rawScaleWeight !== undefined && r.rawScaleWeight !== null && !isNaN(Number(r.rawScaleWeight)))
+    .map(r => ({ time: r.time, rawScaleWeight: Number(r.rawScaleWeight), correctedVal: Number(r[rawKey]) }))
+    .sort((a, b) => a.time - b.time);
+
+  if (readings.length < 6) return [];
+
+  // Robust noise estimate (MAD) from consecutive-point deltas.
+  const deltas = readings.slice(1).map((r, i) => Math.abs(r.rawScaleWeight - readings[i].rawScaleWeight));
+  const sortedDeltas = [...deltas].sort((a, b) => a - b);
+  const median = sortedDeltas.length > 0 ? sortedDeltas[Math.floor(sortedDeltas.length / 2)] : 0;
+  const mad = deltas.length > 0
+    ? [...deltas].map(d => Math.abs(d - median)).sort((a, b) => a - b)[Math.floor(deltas.length / 2)]
+    : 0;
+  const noiseSigma = 1.4826 * mad;
+  const thresholdKg = Math.max(0.015, noiseSigma * 6); // floor of 15g, adapts upward if the scale is noisy
+
+  const windowSize = 5; // minutes, since data is normalized to 1 point/minute
+  const candidates: { idx: number; deltaKg: number; direction: "drop" | "rise" }[] = [];
+
+  for (let i = windowSize; i < readings.length - windowSize; i++) {
+    const before = readings.slice(i - windowSize, i);
+    const after = readings.slice(i, i + windowSize);
+    const avgBefore = before.reduce((s, r) => s + r.rawScaleWeight, 0) / before.length;
+    const avgAfter = after.reduce((s, r) => s + r.rawScaleWeight, 0) / after.length;
+    const signedDeltaKg = avgAfter - avgBefore; // negative = drop, positive = rise
+    if (Math.abs(signedDeltaKg) > thresholdKg) {
+      candidates.push({ idx: i, deltaKg: Math.abs(signedDeltaKg), direction: signedDeltaKg < 0 ? "drop" : "rise" });
+    }
+  }
+
+  // Cluster adjacent candidates (same physical event) and keep the strongest point of each cluster.
+  const clusters: { idx: number; deltaKg: number; direction: "drop" | "rise" }[][] = [];
+  candidates.forEach(c => {
+    const lastCluster = clusters[clusters.length - 1];
+    if (lastCluster && c.idx - lastCluster[lastCluster.length - 1].idx <= windowSize * 2) {
+      lastCluster.push(c);
+    } else {
+      clusters.push([c]);
+    }
+  });
+
+  // Scans outward from a transition boundary (backward for "before", forward for "after") until
+  // it finds a window of readings settled enough (std dev under the scale's own noise level) to
+  // be trusted as the true steady-state weight - instead of blindly averaging a fixed handful of
+  // points that may still be mid-transition (scale settling can take well over 15 minutes after
+  // a big real event like a harvest, which previously made the correction undershoot the actual
+  // jump and left a visible residual step in the corrected curve).
+  const stabilizationWinSize = 8;
+  const noiseThreshold = Math.max(0.01, noiseSigma * 2.5);
+  const maxSearchSteps = 60; // minutes
+  function findStableAvg(fromIdx: number, dir: 1 | -1): number {
+    for (let step = 0; step <= maxSearchSteps; step++) {
+      const idx = fromIdx + dir * step;
+      const winStart = dir === 1 ? idx : idx - stabilizationWinSize + 1;
+      const winEnd = dir === 1 ? idx + stabilizationWinSize : idx + 1;
+      if (winStart < 0 || winEnd > readings.length) continue;
+      const win = readings.slice(winStart, winEnd);
+      const avg = win.reduce((s, r) => s + r.rawScaleWeight, 0) / win.length;
+      const variance = win.reduce((s, r) => s + (r.rawScaleWeight - avg) ** 2, 0) / win.length;
+      if (Math.sqrt(variance) <= noiseThreshold) return avg;
+    }
+    // Nothing settled within the search range (rare) - fall back to the nearest available window.
+    const winStart = dir === 1 ? Math.max(0, fromIdx) : Math.max(0, fromIdx - stabilizationWinSize + 1);
+    const winEnd = dir === 1 ? Math.min(readings.length, fromIdx + stabilizationWinSize) : Math.min(readings.length, fromIdx + 1);
+    const win = readings.slice(winStart, winEnd);
+    return win.length > 0
+      ? win.reduce((s, r) => s + r.rawScaleWeight, 0) / win.length
+      : readings[Math.min(Math.max(fromIdx, 0), readings.length - 1)].rawScaleWeight;
+  }
+
+  const movements: WeightDropCandidate[] = [];
+  clusters.forEach(cluster => {
+    const strongest = cluster.reduce((best, c) => (c.deltaKg > best.deltaKg ? c : best), cluster[0]);
+    const eventTime = readings[strongest.idx].time;
+    const prevScale = readings[strongest.idx - 1]?.rawScaleWeight ?? readings[strongest.idx].rawScaleWeight;
+
+    // Skip if the weight recovers close to its prior level within 30 minutes (temporary fluctuation,
+    // not a real, lasting movement). For a drop it must not bounce back up; for a rise it must not
+    // sag back down.
+    const thirtyMinsLater = eventTime + 30 * 60 * 1000;
+    const postReadings = readings.filter(r => r.time > eventTime && r.time <= thirtyMinsLater);
+    const isCompensated = strongest.direction === "drop"
+      ? postReadings.some(r => r.rawScaleWeight >= prevScale - 0.005)
+      : postReadings.some(r => r.rawScaleWeight <= prevScale + 0.005);
+    if (isCompensated) return;
+
+    const firstIdx = readings.findIndex(r => r.time === readings[cluster[0].idx].time);
+    const lastIdx = readings.findIndex(r => r.time === readings[cluster[cluster.length - 1].idx].time);
+    const avgBeforeStable = findStableAvg(firstIdx - 1, -1);
+    const avgAfterStable = findStableAvg(lastIdx + 1, 1);
+    const adaptiveDeltaKg = Math.abs(avgAfterStable - avgBeforeStable);
+    // The adaptive, settled delta is the source of truth for both the displayed magnitude and the
+    // correction actually applied, so they always match exactly and fully cancel the real jump.
+    const movementGramsPerM2 = (adaptiveDeltaKg / divisor) * multiplier * 1000;
+
+    const d = new Date(eventTime);
+    const dateStr = getStableDateStr(d);
+    const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const suddenVal = Math.round(movementGramsPerM2);
+
+    movements.push({
+      id: getDropId(dateStr, timeStr),
+      dateStr,
+      timeStr,
+      time: eventTime,
+      direction: strongest.direction,
+      suddenDropVal: suddenVal,
+      suggestedCorrectionGrams: Math.max(0, suddenVal),
+      autoEventType: guessMovementEventType(strongest.direction, suddenVal)
+    });
+  });
+
+  return movements;
+}
+
+// Bins raw per-metric readings into one row per minute (unless overridden by timeStep), applies
+// smoothing, and applies every validated weight-drop correction. Pulled out as a pure function so
+// both the Climat/Croissance chart and the Analyseur Agronomique tab (which keeps its own,
+// independent date range/rawDataMap) can share the exact same processing logic.
+function buildChartRows(
+  rawDataMap: { [key: string]: any[] },
+  selectedKeys: string[],
+  metricConfigs: any,
+  plantsOnScale: number,
+  densityPerM2: number,
+  dailyEvents: { [id: string]: string },
+  dailyAdjustedWeights: { [id: string]: number },
+  manualDrops: { [id: string]: { suddenDropTime: string; suddenDropVal: number; suggestedCorrectionGrams: number; direction?: "drop" | "rise" } },
+  timeStep: string,
+  // Optional out-param: when passed, gets filled with the detected/merged movements so callers
+  // that also need the list (e.g. dynamicAgronomicData) don't have to re-run detectWeightMovements
+  // a second time over the same data - that detection pass isn't free (MAD + sliding window +
+  // per-cluster stabilization search), so duplicating it on every keystroke was a real source of lag.
+  outMovements?: WeightDropCandidate[]
+): any[] {
+  if (Object.keys(rawDataMap).length === 0) return [];
+
+  // Normalize every API data point to one value per minute per metric, unless the user
+  // explicitly overrides the step via the time step selector.
+  let step = 1;
+  if (timeStep !== "auto") {
+    step = Number(timeStep);
+  }
+
+  // Apply smoothing if enabled for each sensor
+  const smoothedDataMap: { [key: string]: { readings: any[], rawValues: number[] } } = {};
+  selectedKeys.forEach((key) => {
+    let readings = rawDataMap[key] || [];
+    // Clean up values: filter out null, undefined or non-numeric values (NaN)
+    readings = readings.filter((r: any) => r && r.value !== null && r.value !== undefined && !isNaN(Number(r.value)));
+
+    const config = metricConfigs[key];
+    const isSmooth = config?.smooth === true || config?.smooth === "true";
+    let windowSize = Number(config?.sgWindow || 9);
+
+    // Savitzky-Golay requires an odd window size
+    if (windowSize % 2 === 0) {
+      windowSize += 1;
+    }
+
+    const rawValues = readings.map((r: any) => {
+      if (key === "plant_weight_gain") {
+        const divisor = (plantsOnScale && plantsOnScale > 0) ? plantsOnScale : 6;
+        const multiplier = (densityPerM2 && densityPerM2 > 0) ? densityPerM2 : 2.5;
+        return (r.value / divisor) * multiplier;
+      }
+      return r.value;
+    });
+
+    if (isSmooth && readings.length > 0) {
+      const smoothedValues = applySavitzkyGolay(rawValues, windowSize, 2);
+      smoothedDataMap[key] = {
+        readings: readings.map((r: any, idx: number) => ({
+          ...r,
+          value: smoothedValues[idx]
+        })),
+        rawValues
+      };
+    } else {
+      smoothedDataMap[key] = {
+        readings: readings.map((r: any, idx: number) => ({
+          ...r,
+          value: rawValues[idx]
+        })),
+        rawValues
+      };
+    }
+  });
+
+  const bins: { [key: number]: any } = {};
+
+  selectedKeys.forEach((key) => {
+    const entry = smoothedDataMap[key];
+    const readings = entry?.readings || [];
+    readings.forEach((r, idx) => {
+      const date = new Date(r.time);
+      if (isNaN(date.getTime())) return;
+
+      // Align minutes to the nearest step to group all sensors into matching intervals
+      const mins = date.getMinutes();
+      const binnedMins = Math.round(mins / step) * step;
+      date.setMinutes(binnedMins, 0, 0);
+      const timeMs = date.getTime();
+
+      if (!bins[timeMs]) {
+        bins[timeMs] = {
+          time: timeMs,
+          formattedTime: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          formattedDate: date.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+      }
+      bins[timeMs][key] = r.value;
+      bins[timeMs][`${key}_raw`] = entry.rawValues[idx];
+      if (key === "plant_weight_gain" && r.rawScaleWeight !== undefined) {
+        bins[timeMs]["rawScaleWeight"] = r.rawScaleWeight;
+      }
+    });
+  });
+
+  const sortedRows = Object.values(bins).sort((a: any, b: any) => a.time - b.time);
+
+  // Detect every unexplained weight movement (drop or rise) across the whole continuous range
+  // (not per isolated calendar day, so movements right around midnight are never missed), then
+  // merge in manually-declared ones. Every detected movement gets its own correction applied
+  // automatically and cumulatively from its own timestamp onward - no manual validation gate -
+  // so several movements the same day each get compensated independently instead of only the
+  // largest one being handled. The event type (dailyEvents) is purely an informative label at
+  // this point; it never decides whether the correction is applied.
+  if (selectedKeys.includes("plant_weight_gain")) {
+    const divisor = (plantsOnScale && plantsOnScale > 0) ? plantsOnScale : 6;
+    const multiplier = (densityPerM2 && densityPerM2 > 0) ? densityPerM2 : 2.5;
+    const autoMovements = detectWeightMovements(sortedRows, "plant_weight_gain", divisor, multiplier);
+
+    const movementsById: { [id: string]: WeightDropCandidate } = {};
+    autoMovements.forEach(d => { movementsById[d.id] = d; });
+    Object.keys(manualDrops).forEach(id => {
+      const { dateStr, timeStr } = parseDropId(id);
+      const manual = manualDrops[id];
+      const parts = dateStr.split("/");
+      const dayP = Number(parts[0]);
+      const monthP = Number(parts[1]) - 1;
+      const yearP = Number(parts[2]);
+      const timeParts = (manual.suddenDropTime || timeStr).split(":");
+      const hourP = Number(timeParts[0] || 12);
+      const minP = Number(timeParts[1] || 0);
+      const dropDate = new Date(yearP, monthP, dayP, hourP, minP);
+      const direction = manual.direction || "drop";
+      movementsById[id] = {
+        id,
+        dateStr,
+        timeStr: manual.suddenDropTime || timeStr,
+        time: dropDate.getTime(),
+        direction,
+        suddenDropVal: manual.suddenDropVal,
+        suggestedCorrectionGrams: manual.suggestedCorrectionGrams,
+        autoEventType: guessMovementEventType(direction, manual.suddenDropVal)
+      };
+    });
+
+    const orderedMovements = Object.values(movementsById).sort((a, b) => a.time - b.time);
+    if (outMovements) outMovements.push(...orderedMovements);
+
+    orderedMovements.forEach(movement => {
+      const savedAdj = dailyAdjustedWeights[movement.id];
+      const savedAdjNum = Number(savedAdj);
+      const adjMagnitudeKg = (savedAdj !== undefined && !isNaN(savedAdjNum))
+        ? (savedAdjNum / 1000.0)
+        : (movement.suggestedCorrectionGrams / 1000.0);
+      // A drop is compensated upward (add back the lost biomass); a rise is compensated
+      // downward (remove the artificial gain) so the corrected curve reflects real growth only.
+      const adjKg = movement.direction === "drop" ? adjMagnitudeKg : -adjMagnitudeKg;
+
+      // Cumulative gain resets to 0 every midnight, so a correction must never bleed into
+      // the following day(s) - only rows from the movement's own moment until that same day's end.
+      const dayEnd = new Date(movement.time);
+      dayEnd.setHours(23, 59, 59, 999);
+      const dayEndMs = dayEnd.getTime();
+
+      for (let i = 0; i < sortedRows.length; i++) {
+        if (sortedRows[i].time >= movement.time && sortedRows[i].time <= dayEndMs && sortedRows[i]["plant_weight_gain"] !== undefined) {
+          sortedRows[i]["plant_weight_gain"] = Number(sortedRows[i]["plant_weight_gain"]) + adjKg;
+        }
+      }
+    });
+  }
+
+  return sortedRows;
+}
 
 // Simple matrix inversion for small matrices
 function invertMatrix(M: number[][]): number[][] | null {
@@ -526,15 +863,26 @@ export default function AranetUnifiedDashboard() {
     return [...PLOTTABLE_METRICS, ...customPrivaMetrics];
   }, [customPrivaMetrics]);
 
-  const [activeTab, setActiveTab] = useState<"agronomic" | "selection" | "charts" | "climatique">("charts");
+  const [activeTab, setActiveTab] = useState<"agronomic" | "selection" | "charts" | "chutes" | "fertigation">("charts");
   const [selectedDayNum, setSelectedDayNum] = useState<number>(1);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([
     "temp_rh_top_1",
     "temp_rh_top_2",
     "slab_ec_wc_8",
+    "slab_weight_7",
+    "plant_weight_gain"
+  ]);
+  // Every default-selected sensor is loaded (fetched) from first load, but only "Cumulative
+  // Gain" is visible on the chart out of the box - the rest stay loaded-but-hidden so the first
+  // impression isn't a cluttered chart; the operator can reveal them from the legend below.
+  // Only applies to brand-new sessions (overwritten by the saved localStorage selection below,
+  // same as selectedKeys itself).
+  const [hiddenKeysOnChart, setHiddenKeysOnChart] = useState<string[]>([
+    "temp_rh_top_1",
+    "temp_rh_top_2",
+    "slab_ec_wc_8",
     "slab_weight_7"
   ]);
-  const [hiddenKeysOnChart, setHiddenKeysOnChart] = useState<string[]>([]);
 
   // Priva Climate Computer States
   const [privaCatalog, setPrivaCatalog] = useState<any[]>([]);
@@ -544,6 +892,19 @@ export default function AranetUnifiedDashboard() {
   const [privaChartError, setPrivaChartError] = useState<string | null>(null);
   const [privaSearch, setPrivaSearch] = useState("");
   const [selectedCompartment, setSelectedCompartment] = useState<string>("1");
+
+  // Persistent agronomic agent: statistical correlations this greenhouse's own history has
+  // shown between climate/substrate factors and biomass gain - fetched into the Analyseur
+  // Agronomique tab (not a separate module). The bibliographic literature corpus itself has no
+  // dashboard UI - it's ingested from agro-literature-docs/ via `npm run ingest:agro-literature`.
+  const [agroCorrelations, setAgroCorrelations] = useState<any[]>([]);
+  const [agroCorrelationsInsufficient, setAgroCorrelationsInsufficient] = useState(false);
+  const [agroCorrelationsSampleSize, setAgroCorrelationsSampleSize] = useState<number | null>(null);
+  // Target ranges (IQR of each factor on this greenhouse's own best-efficiency days), nested by
+  // agronomic time slot - a factor's target at Midi isn't its target at Nuit. Turns the
+  // correlations above into an actionable value to aim for, and lets dynamicAgronomicData flag
+  // which factor was outside its slot-specific range (and therefore likely limiting) per slot.
+  const [agroTargetRanges, setAgroTargetRanges] = useState<{ [factorKey: string]: { [slotLabel: string]: { min: number; max: number; sampleSize: number } } }>({});
 
   const fetchPrivaData = async () => {
     setPrivaLoading(true);
@@ -634,7 +995,8 @@ export default function AranetUnifiedDashboard() {
         err.message.toLowerCase().includes("quota") ||
         err.message.toLowerCase().includes("volume") ||
         err.message.toLowerCase().includes("429") ||
-        err.message.toLowerCase().includes("403")
+        err.message.toLowerCase().includes("403") ||
+        err.message.toLowerCase().includes("423")
       );
       if (isQuotaError) {
         console.warn("fetchPrivaData rate limit:", err.message);
@@ -648,8 +1010,39 @@ export default function AranetUnifiedDashboard() {
   };
 
   useEffect(() => {
-    if (activeTab === "climatique") {
+    if (activeTab === "selection") {
       fetchPrivaData();
+    }
+  }, [activeTab]);
+
+  const fetchAgroCorrelations = async () => {
+    try {
+      const res = await fetch("/api/agro-correlations");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erreur de chargement des corrélations.");
+      setAgroCorrelations(data.correlations || []);
+      setAgroCorrelationsInsufficient(!!data.insufficientData);
+      setAgroCorrelationsSampleSize(data.sampleSize ?? null);
+    } catch (e) {
+      console.error("Failed to fetch agro correlations:", e);
+    }
+  };
+
+  const fetchAgroTargetRanges = async () => {
+    try {
+      const res = await fetch("/api/agro-target-ranges");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erreur de chargement des plages cibles.");
+      setAgroTargetRanges(data.ranges || {});
+    } catch (e) {
+      console.error("Failed to fetch agro target ranges:", e);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === "agronomic") {
+      fetchAgroCorrelations();
+      fetchAgroTargetRanges();
     }
   }, [activeTab]);
 
@@ -677,20 +1070,57 @@ export default function AranetUnifiedDashboard() {
   const [yLeftMax, setYLeftMax] = useState<string>("");
   const [yRightMin, setYRightMin] = useState<string>("");
   const [yRightMax, setYRightMax] = useState<string>("");
+  // Same left/right Y-axis override system as Climat/Croissance, but its own values since the
+  // Ferti Irrigation chart plots a different set of sensors over a different date range.
+  const [yLeftMinFerti, setYLeftMinFerti] = useState<string>("");
+  const [yLeftMaxFerti, setYLeftMaxFerti] = useState<string>("");
+  const [yRightMinFerti, setYRightMinFerti] = useState<string>("");
+  const [yRightMaxFerti, setYRightMaxFerti] = useState<string>("");
   const [plantsOnScale, setPlantsOnScale] = useState<number>(6);
   const [densityPerM2, setDensityPerM2] = useState<number>(2.5);
   const [conversionRatio, setConversionRatio] = useState<number>(1.0);
-  const [dailyEvents, setDailyEvents] = useState<{ [dateStr: string]: "none" | "harvest" | "thinning" | "descent" }>({});
-  const [dailyEventsDraft, setDailyEventsDraft] = useState<{ [dateStr: string]: "none" | "harvest" | "thinning" | "descent" }>({});
+
+  // These two feed directly into the weight-movement detection algorithm (MAD + sliding window +
+  // per-cluster stabilization search) via buildChartRows, which isn't cheap to re-run - so typing
+  // is kept snappy locally and the actual heavy recompute only fires once the user pauses.
+  const [plantsOnScaleDraft, setPlantsOnScaleDraft] = useState<string>(String(6));
+  const [densityPerM2Draft, setDensityPerM2Draft] = useState<string>(String(2.5));
+  const plantsOnScaleCommitTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const densityPerM2CommitTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const handlePlantsOnScaleDraftChange = (value: string) => {
+    setPlantsOnScaleDraft(value);
+    if (plantsOnScaleCommitTimeoutRef.current) clearTimeout(plantsOnScaleCommitTimeoutRef.current);
+    plantsOnScaleCommitTimeoutRef.current = setTimeout(() => {
+      setPlantsOnScale(Math.max(1, Number(value) || 1));
+    }, 500);
+  };
+  const handleDensityPerM2DraftChange = (value: string) => {
+    setDensityPerM2Draft(value);
+    if (densityPerM2CommitTimeoutRef.current) clearTimeout(densityPerM2CommitTimeoutRef.current);
+    densityPerM2CommitTimeoutRef.current = setTimeout(() => {
+      setDensityPerM2(Math.max(0.1, Number(value) || 0.1));
+    }, 500);
+  };
+
+  // AI black-box agronomic explanation, keyed per day so each analyzed day keeps its result
+  // cached instead of re-calling the model every time the audit detail is revisited.
+  const [aiAnalysisByDay, setAiAnalysisByDay] = useState<{ [dateStr: string]: { explanation: string; actionPlan: string[]; keyLimitingFactor: string } }>({});
+  const [aiAnalysisLoading, setAiAnalysisLoading] = useState<{ [dateStr: string]: boolean }>({});
+  const [aiAnalysisError, setAiAnalysisError] = useState<{ [dateStr: string]: string }>({});
+  const [dailyEvents, setDailyEvents] = useState<{ [dateStr: string]: "harvest" | "thinning" | "descent" | "recalibration" | "watering" }>({});
+  const [dailyEventsDraft, setDailyEventsDraft] = useState<{ [dateStr: string]: "harvest" | "thinning" | "descent" | "recalibration" | "watering" }>({});
   const [dailyAdjustedWeights, setDailyAdjustedWeights] = useState<{ [dateStr: string]: number }>({});
   const [dailyAdjustedWeightsDraft, setDailyAdjustedWeightsDraft] = useState<{ [dateStr: string]: number }>({});
   const [showAnnotations, setShowAnnotations] = useState<boolean>(true);
-  const [validatingDropDate, setValidatingDropDate] = useState<string | null>(null);
+  const [validatingDropId, setValidatingDropId] = useState<string | null>(null);
   const [timeStep, setTimeStep] = useState<string>("auto");
-  const [manualDrops, setManualDrops] = useState<{ [dateStr: string]: { suddenDropTime: string; suddenDropVal: number; suggestedCorrectionGrams: number } }>({});
+  const [fertiTimeStep, setFertiTimeStep] = useState<string>("auto");
+  const [manualDrops, setManualDrops] = useState<{ [dateStr: string]: { suddenDropTime: string; suddenDropVal: number; suggestedCorrectionGrams: number; direction?: "drop" | "rise" } }>({});
   const [newManualDropDate, setNewManualDropDate] = useState("");
   const [newManualDropTime, setNewManualDropTime] = useState("12:00");
   const [newManualDropVal, setNewManualDropVal] = useState("100");
+  const [newManualDropDirection, setNewManualDropDirection] = useState<"drop" | "rise">("drop");
+
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
     setMounted(true);
@@ -706,6 +1136,130 @@ export default function AranetUnifiedDashboard() {
   const [startDate, setStartDate] = useState<string>(getPastDateStr(2));
   const [endDate, setEndDate] = useState<string>(getPastDateStr(1));
   const [zoomTimeRange, setZoomTimeRange] = useState<{ min: number; max: number } | null>(null);
+
+  // Ferti Irrigation tab - deliberately independent of the main Climat/Croissance selection
+  // (its own sensors, its own date range) so switching sensors there never disturbs the main chart.
+  // Any sensor (Aranet or Priva) can be added here, not just the original fixed slab/weight set.
+  const [fertiSelectedKeys, setFertiSelectedKeys] = useState<string[]>([
+    ...FERTI_METRIC_KEYS,
+    "plant_weight_gain"
+  ]);
+  // Same "loaded but hidden by default" pattern as hiddenKeysOnChart for Climat/Croissance -
+  // only Gain Cumulé is visible out of the box, the substrate/weight sensors stay loaded and
+  // revealable from the legend. Only applies to brand-new sessions (no saved selection yet).
+  const [hiddenFertiKeysOnChart, setHiddenFertiKeysOnChart] = useState<string[]>(FERTI_METRIC_KEYS);
+  const [fertiRawDataMap, setFertiRawDataMap] = useState<{ [key: string]: any[] }>({});
+  const [fertiLoading, setFertiLoading] = useState(false);
+  const [fertiError, setFertiError] = useState<string | null>(null);
+  const [fertiPrivaError, setFertiPrivaError] = useState<string | null>(null);
+  const [fertiStartDate, setFertiStartDate] = useState<string>(getPastDateStr(7));
+  const [fertiEndDate, setFertiEndDate] = useState<string>(getPastDateStr(0));
+
+  // Same draft/commit pattern as startDate/endDate below (via commitDateRange) - typing/picking
+  // a date only updates the draft, the fetch only fires when "Charger" is clicked.
+  const [fertiStartDateDraft, setFertiStartDateDraft] = useState<string>(fertiStartDate);
+  const [fertiEndDateDraft, setFertiEndDateDraft] = useState<string>(fertiEndDate);
+  const fertiStartDateDraftRef = useRef(fertiStartDate);
+  const fertiEndDateDraftRef = useRef(fertiEndDate);
+
+  useEffect(() => {
+    setFertiStartDateDraft(fertiStartDate);
+    fertiStartDateDraftRef.current = fertiStartDate;
+  }, [fertiStartDate]);
+  useEffect(() => {
+    setFertiEndDateDraft(fertiEndDate);
+    fertiEndDateDraftRef.current = fertiEndDate;
+  }, [fertiEndDate]);
+
+  const commitFertiDateRange = () => {
+    const rawStart = fertiStartDateDraftRef.current;
+    const rawEnd = fertiEndDateDraftRef.current;
+    if (!rawStart || !rawEnd) return;
+
+    let sd = new Date(rawStart);
+    let ed = new Date(rawEnd);
+    if (isNaN(sd.getTime()) || isNaN(ed.getTime())) return;
+    sd.setHours(0, 0, 0, 0);
+    ed.setHours(23, 59, 59, 999);
+
+    if (sd > ed) {
+      const tmp = sd;
+      sd = ed;
+      ed = tmp;
+    }
+
+    const maxRangeMs = 30 * 24 * 3600 * 1000;
+    if (ed.getTime() - sd.getTime() > maxRangeMs) {
+      ed = new Date(sd.getTime() + maxRangeMs);
+    }
+
+    setFertiStartDate(sd.toISOString().split("T")[0]);
+    setFertiEndDate(ed.toISOString().split("T")[0]);
+  };
+
+  const handleFertiStartDateDraftChange = (value: string) => {
+    setFertiStartDateDraft(value);
+    fertiStartDateDraftRef.current = value;
+  };
+  const handleFertiEndDateDraftChange = (value: string) => {
+    setFertiEndDateDraft(value);
+    fertiEndDateDraftRef.current = value;
+  };
+
+  // The date inputs are decoupled from the committed range: typing/picking a date only updates
+  // the draft (instant, cheap) - the expensive fetch + chart/audit recompute only fires when the
+  // user explicitly clicks "Charger" (commitDateRange), not on every keystroke/date pick. This is
+  // shared by both the Climat/Croissance chart and the Mouvements de Poids mini-chart.
+  const [startDateDraft, setStartDateDraft] = useState<string>(startDate);
+  const [endDateDraft, setEndDateDraft] = useState<string>(endDate);
+  const startDateDraftRef = useRef(startDate);
+  const endDateDraftRef = useRef(endDate);
+
+  useEffect(() => {
+    setStartDateDraft(startDate);
+    startDateDraftRef.current = startDate;
+  }, [startDate]);
+  useEffect(() => {
+    setEndDateDraft(endDate);
+    endDateDraftRef.current = endDate;
+  }, [endDate]);
+
+  const commitDateRange = () => {
+    const rawStart = startDateDraftRef.current;
+    const rawEnd = endDateDraftRef.current;
+    if (!rawStart || !rawEnd) return;
+
+    let sd = new Date(rawStart);
+    let ed = new Date(rawEnd);
+    if (isNaN(sd.getTime()) || isNaN(ed.getTime())) return;
+    sd.setHours(0, 0, 0, 0);
+    ed.setHours(23, 59, 59, 999);
+
+    // Swap instead of silently ignoring if the user picked them in reverse order.
+    if (sd > ed) {
+      const tmp = sd;
+      sd = ed;
+      ed = tmp;
+    }
+
+    const maxRangeMs = 30 * 24 * 3600 * 1000;
+    if (ed.getTime() - sd.getTime() > maxRangeMs) {
+      ed = new Date(sd.getTime() + maxRangeMs);
+    }
+
+    setStartDate(sd.toISOString().split("T")[0]);
+    setEndDate(ed.toISOString().split("T")[0]);
+  };
+
+  const handleStartDateDraftChange = (value: string) => {
+    setStartDateDraft(value);
+    startDateDraftRef.current = value;
+  };
+
+  const handleEndDateDraftChange = (value: string) => {
+    setEndDateDraft(value);
+    endDateDraftRef.current = value;
+  };
 
   const startDateTime = useMemo(() => {
     const d = new Date(startDate);
@@ -740,47 +1294,174 @@ export default function AranetUnifiedDashboard() {
     return Math.min(30, Math.max(1, isNaN(diffDays) ? 7 : diffDays));
   }, [startDateTime, endDateTime]);
 
-  const handleStartDateChange = (dateStr: string) => {
-    if (!dateStr) return;
-    const newStart = new Date(dateStr);
-    newStart.setHours(0, 0, 0, 0);
-    const currentEnd = new Date(endDate);
-    currentEnd.setHours(23, 59, 59, 999);
+  // Analyseur Agronomique - independent date range from Climat/Croissance: its own committed
+  // dates, its own draft/debounce (same anti-freeze pattern as the main range), own raw data
+  // and its own fetch, so browsing a different period there never touches the main chart.
+  const [agroStartDate, setAgroStartDate] = useState<string>(getPastDateStr(7));
+  const [agroEndDate, setAgroEndDate] = useState<string>(getPastDateStr(1));
+  const [agroStartDateDraft, setAgroStartDateDraft] = useState<string>(agroStartDate);
+  const [agroEndDateDraft, setAgroEndDateDraft] = useState<string>(agroEndDate);
+  const agroStartDateDraftRef = useRef(agroStartDate);
+  const agroEndDateDraftRef = useRef(agroEndDate);
+  const agroDateCommitTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-    if (newStart > currentEnd) {
-      setEndDate(dateStr);
-    } else {
-      const limitDate = new Date(currentEnd);
-      limitDate.setDate(limitDate.getDate() - 30);
-      if (newStart < limitDate) {
-        const newEnd = new Date(newStart);
-        newEnd.setDate(newEnd.getDate() + 30);
-        setEndDate(newEnd.toISOString().split("T")[0]);
-      }
+  useEffect(() => {
+    setAgroStartDateDraft(agroStartDate);
+    agroStartDateDraftRef.current = agroStartDate;
+  }, [agroStartDate]);
+  useEffect(() => {
+    setAgroEndDateDraft(agroEndDate);
+    agroEndDateDraftRef.current = agroEndDate;
+  }, [agroEndDate]);
+
+  const commitAgroDateRange = () => {
+    const rawStart = agroStartDateDraftRef.current;
+    const rawEnd = agroEndDateDraftRef.current;
+    if (!rawStart || !rawEnd) return;
+
+    let sd = new Date(rawStart);
+    let ed = new Date(rawEnd);
+    if (isNaN(sd.getTime()) || isNaN(ed.getTime())) return;
+    sd.setHours(0, 0, 0, 0);
+    ed.setHours(23, 59, 59, 999);
+
+    if (sd > ed) {
+      const tmp = sd;
+      sd = ed;
+      ed = tmp;
     }
-    setStartDate(dateStr);
+
+    const maxRangeMs = 30 * 24 * 3600 * 1000;
+    if (ed.getTime() - sd.getTime() > maxRangeMs) {
+      ed = new Date(sd.getTime() + maxRangeMs);
+    }
+
+    setAgroStartDate(sd.toISOString().split("T")[0]);
+    setAgroEndDate(ed.toISOString().split("T")[0]);
   };
 
-  const handleEndDateChange = (dateStr: string) => {
-    if (!dateStr) return;
-    const newEnd = new Date(dateStr);
-    newEnd.setHours(23, 59, 59, 999);
-    const currentStart = new Date(startDate);
-    currentStart.setHours(0, 0, 0, 0);
-
-    if (newEnd < currentStart) {
-      setStartDate(dateStr);
-    } else {
-      const limitDate = new Date(currentStart);
-      limitDate.setDate(limitDate.getDate() + 30);
-      if (newEnd > limitDate) {
-        const newStart = new Date(newEnd);
-        newStart.setDate(newStart.getDate() - 30);
-        setStartDate(newStart.toISOString().split("T")[0]);
-      }
-    }
-    setEndDate(dateStr);
+  const scheduleAgroDateCommit = () => {
+    if (agroDateCommitTimeoutRef.current) clearTimeout(agroDateCommitTimeoutRef.current);
+    agroDateCommitTimeoutRef.current = setTimeout(() => {
+      commitAgroDateRange();
+    }, 700);
   };
+
+  const handleAgroStartDateDraftChange = (value: string) => {
+    setAgroStartDateDraft(value);
+    agroStartDateDraftRef.current = value;
+    scheduleAgroDateCommit();
+  };
+
+  const handleAgroEndDateDraftChange = (value: string) => {
+    setAgroEndDateDraft(value);
+    agroEndDateDraftRef.current = value;
+    scheduleAgroDateCommit();
+  };
+
+  const agroStartDateTime = useMemo(() => {
+    const d = new Date(agroStartDate);
+    if (isNaN(d.getTime())) {
+      const fallback = new Date();
+      fallback.setDate(fallback.getDate() - 7);
+      fallback.setHours(0, 0, 0, 0);
+      return fallback;
+    }
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }, [agroStartDate]);
+
+  const agroEndDateTime = useMemo(() => {
+    const d = new Date(agroEndDate);
+    if (isNaN(d.getTime())) {
+      const fallback = new Date();
+      fallback.setHours(23, 59, 59, 999);
+      return fallback;
+    }
+    d.setHours(23, 59, 59, 999);
+    return d;
+  }, [agroEndDate]);
+
+  const agroApiDaysRequested = useMemo(() => {
+    const now = new Date();
+    const startMs = agroStartDateTime.getTime();
+    const endMs = agroEndDateTime.getTime();
+    if (isNaN(startMs) || isNaN(endMs)) return 7;
+    const diffTime = Math.abs(now.getTime() - startMs);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return Math.min(30, Math.max(1, isNaN(diffDays) ? 7 : diffDays));
+  }, [agroStartDateTime, agroEndDateTime]);
+
+  // Which sensors feed the Analyseur Agronomique tab's own data pool (agroRawDataMap /
+  // agroFertiRawDataMap below) - deliberately a superset of, not equal to, the chart display
+  // selection. selectedKeys/fertiSelectedKeys are a display concern (what's plotted); the
+  // agronomic analysis should be driven by which sensors are tagged with a "Rôle Agronomique",
+  // regardless of chart visibility - a radiation_sum sensor unchecked on the chart must still
+  // feed the analysis. selectedKeys/fertiSelectedKeys are still unioned in (not dropped) so the
+  // untagged name-heuristic fallback in keysByRole/keysByRoleAll below keeps working for anyone
+  // who hasn't tagged everything yet. The weight/gain sensors are always included unconditionally
+  // because the drop-detection/correction pipeline (buildChartRows) needs them to produce a
+  // usable actualGain - without that correction the raw scale delta isn't exploitable.
+  const agroAnalysisKeys = useMemo(() => {
+    const tagged = Object.keys(metricConfigs).filter(k => {
+      const role = metricConfigs[k]?.agroRole;
+      return role && role !== "none";
+    });
+    return Array.from(new Set([...tagged, ...selectedKeys, ...fertiSelectedKeys, "plant_weight_gain", "plant_weight_7"]));
+  }, [metricConfigs]);
+
+  const [agroRawDataMap, setAgroRawDataMap] = useState<{ [key: string]: any[] }>({});
+  const [agroLoading, setAgroLoading] = useState(false);
+  const [agroError, setAgroError] = useState<string | null>(null);
+  const [agroPrivaChartError, setAgroPrivaChartError] = useState<string | null>(null);
+
+  const fetchAgroData = () => fetchDataForRange(
+    agroAnalysisKeys, agroStartDateTime, agroEndDateTime, agroApiDaysRequested,
+    setAgroRawDataMap, setAgroLoading, setAgroError, setAgroPrivaChartError
+  );
+
+  const agroFetchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (Object.keys(metricConfigs).length > 0) {
+      if (agroFetchTimeoutRef.current) clearTimeout(agroFetchTimeoutRef.current);
+      agroFetchTimeoutRef.current = setTimeout(() => {
+        fetchAgroData();
+      }, 300);
+    }
+    return () => {
+      if (agroFetchTimeoutRef.current) clearTimeout(agroFetchTimeoutRef.current);
+    };
+  }, [agroAnalysisKeys, agroStartDate, agroEndDate]);
+
+  // The advanced agronomic analysis also factors in Ferti Irrigation data (substrate VWC/EC,
+  // slab/plant weight) over the Analyseur Agronomique tab's own date range, so its audits and
+  // AI black-box context aren't climate-only - irrigation/substrate conditions explain plant
+  // behavior just as much as temperature/light do.
+  const [agroFertiRawDataMap, setAgroFertiRawDataMap] = useState<{ [key: string]: any[] }>({});
+  const [agroFertiLoading, setAgroFertiLoading] = useState(false);
+  const [agroFertiError, setAgroFertiError] = useState<string | null>(null);
+  const [agroFertiPrivaError, setAgroFertiPrivaError] = useState<string | null>(null);
+
+  // Same agroAnalysisKeys pool as the climate fetch above (not fertiSelectedKeys) - the merge in
+  // dynamicAgronomicData concatenates both raw maps by date anyway, and every role-tagged sensor
+  // (whichever chart, if any, it happens to be checked on) needs to be visible to the analysis.
+  const fetchAgroFertiData = () => fetchDataForRange(
+    agroAnalysisKeys, agroStartDateTime, agroEndDateTime, agroApiDaysRequested,
+    setAgroFertiRawDataMap, setAgroFertiLoading, setAgroFertiError, setAgroFertiPrivaError
+  );
+
+  const agroFertiFetchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (Object.keys(metricConfigs).length > 0) {
+      if (agroFertiFetchTimeoutRef.current) clearTimeout(agroFertiFetchTimeoutRef.current);
+      agroFertiFetchTimeoutRef.current = setTimeout(() => {
+        fetchAgroFertiData();
+      }, 300);
+    }
+    return () => {
+      if (agroFertiFetchTimeoutRef.current) clearTimeout(agroFertiFetchTimeoutRef.current);
+    };
+  }, [agroAnalysisKeys, agroStartDate, agroEndDate]);
 
   const [isLoaded, setIsLoaded] = useState(false);
 
@@ -801,12 +1482,18 @@ export default function AranetUnifiedDashboard() {
       const savedPlants = localStorage.getItem("aranet_plants_on_scale");
       if (savedPlants) {
         const val = Number(savedPlants);
-        if (!isNaN(val) && val > 0) setPlantsOnScale(val);
+        if (!isNaN(val) && val > 0) {
+          setPlantsOnScale(val);
+          setPlantsOnScaleDraft(savedPlants);
+        }
       }
       const savedDensity = localStorage.getItem("aranet_density_per_m2");
       if (savedDensity) {
         const val = Number(savedDensity);
-        if (!isNaN(val) && val > 0) setDensityPerM2(val);
+        if (!isNaN(val) && val > 0) {
+          setDensityPerM2(val);
+          setDensityPerM2Draft(savedDensity);
+        }
       }
       const savedRatio = localStorage.getItem("aranet_conversion_ratio");
       if (savedRatio) {
@@ -890,8 +1577,98 @@ export default function AranetUnifiedDashboard() {
     }
   }, [selectedKeys, metricConfigs, isLoaded, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, dailyAdjustedWeights, showAnnotations, customPrivaMetrics, timeStep, manualDrops]);
 
+  // Mirror the current sensor selection into Supabase (debounced) so the daily archive cron
+  // job - which runs server-side with no access to localStorage - knows which Aranet sensors
+  // to fetch and save. Priva keys are filtered out: the archive job only covers Aranet for now.
+  const selectionSyncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (selectionSyncTimeoutRef.current) clearTimeout(selectionSyncTimeoutRef.current);
+    selectionSyncTimeoutRef.current = setTimeout(() => {
+      const aranetOnlyKeys = selectedKeys.filter(k => !k.startsWith("priva_"));
+      fetch("/api/aranet/selected-sensors", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "climat_croissance", metricKeys: aranetOnlyKeys })
+      }).catch(e => console.error("Failed to sync sensor selection:", e));
+    }, 1000);
+    return () => {
+      if (selectionSyncTimeoutRef.current) clearTimeout(selectionSyncTimeoutRef.current);
+    };
+  }, [selectedKeys, isLoaded]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    // Priva keys are filtered out here too: the daily archive cron only covers Aranet for now.
+    const aranetOnlyFertiKeys = fertiSelectedKeys.filter(k => !k.startsWith("priva_"));
+    fetch("/api/aranet/selected-sensors", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "ferti_irrigation", metricKeys: aranetOnlyFertiKeys })
+    }).catch(e => console.error("Failed to sync ferti sensor selection:", e));
+  }, [fertiSelectedKeys, isLoaded]);
+
+  // Mirror every sensor's "Rôle Agronomique" tag into Supabase (debounced) so the daily archive
+  // cron - which has no access to this React state - can resolve "which archived sensor is
+  // temp_serre / radiation_sum / etc." and compute agro_daily_summary automatically every night,
+  // not only when this tab is opened. Covers Priva-tagged sensors too (e.g. a Priva radiation-sum
+  // point) now that the cron archives Priva readings as well - see the selected-points sync below.
+  const metricRolesSyncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (metricRolesSyncTimeoutRef.current) clearTimeout(metricRolesSyncTimeoutRef.current);
+    metricRolesSyncTimeoutRef.current = setTimeout(() => {
+      const roles = Object.entries(metricConfigs)
+        .filter(([, config]) => config?.agroRole && config.agroRole !== "none")
+        .map(([key, config]) => ({ metricKey: key, agroRole: config.agroRole }));
+      fetch("/api/aranet/metric-roles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ roles })
+      }).catch(e => console.error("Failed to sync metric roles:", e));
+    }, 1000);
+    return () => {
+      if (metricRolesSyncTimeoutRef.current) clearTimeout(metricRolesSyncTimeoutRef.current);
+    };
+  }, [metricConfigs, isLoaded]);
+
+  // Mirror the currently-selected Priva sensors (fixed or custom catalog points) into Supabase
+  // (debounced), the same way the Aranet selection is mirrored above - the daily archive cron
+  // needs each point's variableId/deviceId/deviceGroupId to query Priva's API directly, and that
+  // data only exists in allMetrics (fixed PLOTTABLE_METRICS entries + customPrivaMetrics, both
+  // client-side state) - see app/api/priva/selected-points/route.ts.
+  const privaSelectionSyncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (privaSelectionSyncTimeoutRef.current) clearTimeout(privaSelectionSyncTimeoutRef.current);
+    privaSelectionSyncTimeoutRef.current = setTimeout(() => {
+      const privaKeys = Array.from(new Set([...selectedKeys, ...fertiSelectedKeys])).filter(k => k.startsWith("priva_"));
+      const points = privaKeys
+        .map(key => {
+          const m = allMetrics.find(item => item.key === key);
+          if (!m || !m.variableId || !m.deviceId) return null;
+          return { metricKey: key, variableId: m.variableId, deviceId: m.deviceId, deviceGroupId: m.deviceGroupId };
+        })
+        .filter((p): p is { metricKey: string; variableId: string; deviceId: string; deviceGroupId: string } => p !== null);
+      fetch("/api/priva/selected-points", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ points })
+      }).catch(e => console.error("Failed to sync Priva selected points:", e));
+    }, 1000);
+    return () => {
+      if (privaSelectionSyncTimeoutRef.current) clearTimeout(privaSelectionSyncTimeoutRef.current);
+    };
+  }, [selectedKeys, fertiSelectedKeys, allMetrics, isLoaded]);
+
   const toggleKey = (key: string) => {
-    setSelectedKeys(prev => 
+    setSelectedKeys(prev =>
+      prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
+    );
+  };
+
+  const toggleFertiKey = (key: string) => {
+    setFertiSelectedKeys(prev =>
       prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
     );
   };
@@ -915,13 +1692,17 @@ export default function AranetUnifiedDashboard() {
   const handleAddManualDrop = () => {
     if (!newManualDropDate) return;
     const val = parseFloat(newManualDropVal) || 0;
+    const normDate = normalizeDateKey(newManualDropDate);
+    const dropId = getDropId(normDate, newManualDropTime);
+    const guessedType = guessMovementEventType(newManualDropDirection, val);
     setManualDrops(prev => {
       const updated = {
         ...prev,
-        [newManualDropDate]: {
+        [dropId]: {
           suddenDropTime: newManualDropTime,
           suddenDropVal: val,
-          suggestedCorrectionGrams: val
+          suggestedCorrectionGrams: val,
+          direction: newManualDropDirection
         }
       };
       localStorage.setItem("aranet_manual_drops", JSON.stringify(updated));
@@ -929,21 +1710,60 @@ export default function AranetUnifiedDashboard() {
     });
     setDailyEventsDraft(prev => ({
       ...prev,
-      [newManualDropDate]: "harvest"
+      [dropId]: guessedType
     }));
     setDailyAdjustedWeightsDraft(prev => ({
       ...prev,
-      [newManualDropDate]: val
+      [dropId]: val
     }));
     setDailyEvents(prev => ({
       ...prev,
-      [newManualDropDate]: "harvest"
+      [dropId]: guessedType
     }));
     setDailyAdjustedWeights(prev => ({
       ...prev,
-      [newManualDropDate]: val
+      [dropId]: val
     }));
     setNewManualDropDate("");
+  };
+
+  // Calls the AI black-box endpoint to explain a specific day's growth outcome, grounded in
+  // that day's climate/growth summary rather than the static rule-based sentences.
+  const handleAnalyzeDayWithAI = async (day: any) => {
+    setAiAnalysisLoading(prev => ({ ...prev, [day.dateStr]: true }));
+    setAiAnalysisError(prev => ({ ...prev, [day.dateStr]: "" }));
+    try {
+      const res = await fetch("/api/agro-ai-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dateStr: day.dateStr,
+          climate: day.aiContext,
+          actualGain: day.actualGain,
+          radiationSumJcm2: day.radiationSumJcm2,
+          growthEfficiency: day.growthEfficiency,
+          bestEfficiencyInRange: day.bestEfficiencyInRange,
+          lostGainVsBestDay: day.lostGainVsBestDay,
+          lostPercentVsBestDay: day.lostPercentVsBestDay,
+          drops: (day.drops || []).map((d: WeightDropCandidate) => ({ time: d.timeStr, valGm2: d.suddenDropVal })),
+          ruleBasedFindings: day.aiContext?.ruleBasedFindings || [],
+          // Per-slot limiting factor (already computed against THAT slot's own target range, not
+          // a single daily figure - see dynamicAgronomicData/limitingFactorsBySlot) so the model
+          // reasons about when in the day something was off, not just a daily verdict.
+          limitingFactorsBySlot: (day.limitingFactorsBySlot || []).map((s: any) => ({
+            slot: s.label,
+            limitingFactor: s.limitingFactor ? { field: s.limitingFactor.field, value: s.limitingFactor.value, targetMin: s.limitingFactor.range.min, targetMax: s.limitingFactor.range.max } : null
+          }))
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || data.error || "Erreur d'analyse IA.");
+      setAiAnalysisByDay(prev => ({ ...prev, [day.dateStr]: data }));
+    } catch (err: any) {
+      setAiAnalysisError(prev => ({ ...prev, [day.dateStr]: err.message || "Erreur d'analyse IA." }));
+    } finally {
+      setAiAnalysisLoading(prev => ({ ...prev, [day.dateStr]: false }));
+    }
   };
 
   // Helper to toggle custom datapoint from full catalog
@@ -1023,24 +1843,43 @@ export default function AranetUnifiedDashboard() {
     });
   };
 
-  const fetchActiveData = async () => {
-    if (selectedKeys.length === 0) {
-      setRawDataMap({});
+  // Fetches Aranet + Priva data for an explicit date range and sensor list, and reports the
+  // result via the passed setters instead of closing over one fixed range/state slot - this
+  // lets Climat/Croissance and Analyseur Agronomique keep their own independent date ranges
+  // (and their own rawDataMap/chartData) while still sharing the same request caches.
+  const fetchDataForRange = async (
+    keys: string[],
+    rangeStart: Date,
+    rangeEnd: Date,
+    rangeApiDays: number,
+    onDataMap: (dataMap: { [key: string]: any[] }) => void,
+    onLoadingChange: (loading: boolean) => void,
+    onError: (msg: string | null) => void,
+    onPrivaError: (msg: string | null) => void
+  ) => {
+    if (keys.length === 0) {
+      onDataMap({});
       return;
     }
-    setLoading(true);
-    setError(null);
-    setPrivaChartError(null);
+    onLoadingChange(true);
+    onError(null);
+    onPrivaError(null);
     try {
-      const aranetKeys = selectedKeys.filter(k => !k.startsWith("priva_"));
-      const privaKeys = selectedKeys.filter(k => k.startsWith("priva_"));
+      const aranetKeys = keys.filter(k => !k.startsWith("priva_"));
+      const privaKeys = keys.filter(k => k.startsWith("priva_"));
 
       // 1. Fetch Aranet data in parallel
       const aranetPromises = aranetKeys.map(async (key) => {
         const m = allMetrics.find(item => item.key === key)!;
         const config = metricConfigs[key] || { unit: m.units[0].id, range: "24h", axis: "left" };
-        
-        const cacheKey = `aranet_${m.sensorId}_${apiDaysRequested}_${config.unit}`;
+
+        // Scoped per metric (not just per sensor): the Aranet Cloud API caps each history
+        // request at 10000 readings shared across every metric of a sensor. A multi-metric
+        // sensor like the slab EC/WC probe (temp, VWC, bulk EC, pore EC) would silently drop
+        // its later metrics - pore EC in particular - once temp+VWC alone filled the cap over
+        // a long enough range. Passing "metric" scopes each request (and its cache) to a
+        // single channel so every metric gets its own 10000-reading budget.
+        const cacheKey = `aranet_${m.sensorId}_${m.metricId}_${rangeApiDays}_${config.unit}`;
         let readingsData = aranetCacheRef.current[cacheKey];
         if (!readingsData) {
           try {
@@ -1056,22 +1895,22 @@ export default function AranetUnifiedDashboard() {
 
         if (!readingsData) {
           const res = await fetch(
-            `/api/aranet?action=history&sensor=${m.sensorId}&days=${apiDaysRequested}&unit=${config.unit}`
+            `/api/aranet?action=history&sensor=${m.sensorId}&metric=${m.metricId}&days=${rangeApiDays}&unit=${config.unit}`
           );
           if (!res.ok) throw new Error(`Erreur pour ${m.name}`);
           const resData = await res.json();
           if (!resData.success) throw new Error(resData.error || `Erreur pour ${m.name}`);
           readingsData = resData.readings || [];
-          
+
           aranetCacheRef.current[cacheKey] = readingsData;
           safeSetSessionStorage("aranet_query_cache_" + cacheKey, JSON.stringify(readingsData));
         }
-        
+
         let readings = readingsData.filter((r: any) => r.metric === m.metricId).map((r: any) => ({ ...r }));
 
         // Filter readings client-side based on the selected date range
-        const startMs = startDateTime.getTime();
-        const endMs = endDateTime.getTime();
+        const startMs = rangeStart.getTime();
+        const endMs = rangeEnd.getTime();
         readings = readings.filter((r: any) => {
           const t = new Date(r.time).getTime();
           return t >= startMs && t <= endMs;
@@ -1131,8 +1970,8 @@ export default function AranetUnifiedDashboard() {
         });
 
         // Ensure we cap the end date to avoid today midnight 403 restriction
-        let adjustedStart = startDateTime;
-        let adjustedEnd = endDateTime;
+        let adjustedStart = rangeStart;
+        let adjustedEnd = rangeEnd;
 
         const todayMidnight = new Date();
         todayMidnight.setUTCHours(0, 0, 0, 0);
@@ -1176,13 +2015,13 @@ export default function AranetUnifiedDashboard() {
           
           const today = new Date();
           today.setHours(0, 0, 0, 0);
-          if (endDateTime.getTime() >= today.getTime()) {
-            setPrivaChartError("Info : L'API Priva n'autorise pas l'accès aux données de la journée en cours en temps réel. Les courbes s'arrêtent à hier 23h59.");
+          if (rangeEnd.getTime() >= today.getTime()) {
+            onPrivaError("Info : L'API Priva n'autorise pas l'accès aux données de la journée en cours en temps réel. Les courbes s'arrêtent à hier 23h59.");
           }
         } else if (Date.now() < privaLockoutExpiryRef.current) {
           hasCache = true;
           const remainingSecs = Math.ceil((privaLockoutExpiryRef.current - Date.now()) / 1000);
-          setPrivaChartError(`Info : Limite d'appels API atteinte. Actualisation automatique en pause (cooldown actif de ${remainingSecs}s pour laisser recharger le quota).`);
+          onPrivaError(`Info : Limite d'appels API atteinte. Actualisation automatique en pause (cooldown actif de ${remainingSecs}s pour laisser recharger le quota).`);
         }
 
         if (!hasCache) {
@@ -1199,9 +2038,11 @@ export default function AranetUnifiedDashboard() {
           if (!valRes.ok) {
             const errDetail = await valRes.json().catch(() => ({}));
             
-            if (valRes.status === 429 || valRes.status === 403) {
+            if (valRes.status === 429 || valRes.status === 403 || valRes.status === 423) {
+              // 423 = Locked - Priva returns this (alongside 429/403) when the same query is hit
+              // too frequently/concurrently, not a real client error - same cooldown treatment.
               privaLockoutExpiryRef.current = Date.now() + 60000; // Lock out for 60 seconds
-              console.warn("Priva API Quota Exceeded (429/403). Cooldown active.");
+              console.warn("Priva API Quota Exceeded (429/403/423). Cooldown active.");
             } else {
               console.error("Priva API Error in fetchActiveData:", valRes.status, errDetail);
             }
@@ -1216,7 +2057,7 @@ export default function AranetUnifiedDashboard() {
                 errMsg = errDetail.details;
               }
             }
-            setPrivaChartError(`Données Priva indisponibles (Status ${valRes.status}) : ${errMsg}`);
+            onPrivaError(`Données Priva indisponibles (Status ${valRes.status}) : ${errMsg}`);
           } else {
             const valData = await valRes.json();
             series = valData.data || [];
@@ -1225,8 +2066,8 @@ export default function AranetUnifiedDashboard() {
 
             const today = new Date();
             today.setHours(0, 0, 0, 0);
-            if (endDateTime.getTime() >= today.getTime()) {
-              setPrivaChartError("Info : L'API Priva n'autorise pas l'accès aux données de la journée en cours en temps réel. Les courbes s'arrêtent à hier 23h59.");
+            if (rangeEnd.getTime() >= today.getTime()) {
+              onPrivaError("Info : L'API Priva n'autorise pas l'accès aux données de la journée en cours en temps réel. Les courbes s'arrêtent à hier 23h59.");
             }
           }
         }
@@ -1256,14 +2097,19 @@ export default function AranetUnifiedDashboard() {
         dataMap[res.key] = res.readings;
       });
       
-      setRawDataMap(dataMap);
+      onDataMap(dataMap);
     } catch (err: any) {
       console.error(err);
-      setError("Échec du chargement des données.");
+      onError("Échec du chargement des données.");
     } finally {
-      setLoading(false);
+      onLoadingChange(false);
     }
   };
+
+  const fetchActiveData = () => fetchDataForRange(
+    selectedKeys, startDateTime, endDateTime, apiDaysRequested,
+    setRawDataMap, setLoading, setError, setPrivaChartError
+  );
 
   // Debounce ref to deduplicate rapid multiple fetches on state change
   const fetchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -1288,6 +2134,108 @@ export default function AranetUnifiedDashboard() {
     };
   }, [selectedKeys, startDate, endDate]);
 
+  // Ferti Irrigation tab data fetch - independent of the main fetchActiveData/selectedKeys, but
+  // shares fetchDataForRange (Aranet + Priva) so any sensor from either source can be plotted here.
+  const fetchFertiData = () => {
+    const start = new Date(fertiStartDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(fertiEndDate);
+    end.setHours(23, 59, 59, 999);
+    const daysRequested = Math.min(30, Math.max(1, Math.ceil((Date.now() - start.getTime()) / (1000 * 60 * 60 * 24))));
+    return fetchDataForRange(
+      fertiSelectedKeys, start, end, daysRequested,
+      setFertiRawDataMap, setFertiLoading, setFertiError, setFertiPrivaError
+    );
+  };
+
+  const fertiFetchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (fertiFetchTimeoutRef.current) clearTimeout(fertiFetchTimeoutRef.current);
+    fertiFetchTimeoutRef.current = setTimeout(() => {
+      fetchFertiData();
+    }, 300);
+    return () => {
+      if (fertiFetchTimeoutRef.current) clearTimeout(fertiFetchTimeoutRef.current);
+    };
+  }, [fertiSelectedKeys, fertiStartDate, fertiEndDate]);
+
+  // Bin ferti readings per sensor, aligned to fertiTimeStep (same align-to-step approach as
+  // buildChartRows for the main chart) so the "Intervalle" selector in the banner has an effect.
+  const fertiChartData = useMemo(() => {
+    if (Object.keys(fertiRawDataMap).length === 0) return [];
+    const step = fertiTimeStep === "auto" ? 1 : Number(fertiTimeStep);
+    const bins: { [timeMs: number]: any } = {};
+    fertiSelectedKeys.forEach(key => {
+      const readings = (fertiRawDataMap[key] || []).filter((r: any) => r && r.value !== null && r.value !== undefined && !isNaN(Number(r.value)));
+      readings.forEach((r: any) => {
+        const date = new Date(r.time);
+        if (isNaN(date.getTime())) return;
+        const mins = date.getMinutes();
+        const binnedMins = Math.round(mins / step) * step;
+        date.setMinutes(binnedMins, 0, 0);
+        const timeMs = date.getTime();
+        if (!bins[timeMs]) {
+          bins[timeMs] = {
+            time: timeMs,
+            formattedTime: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          };
+        }
+        bins[timeMs][key] = Number(r.value);
+      });
+    });
+    return Object.values(bins).sort((a: any, b: any) => a.time - b.time);
+  }, [fertiRawDataMap, fertiSelectedKeys, fertiTimeStep]);
+
+  // Same per-minute binning, but over the Analyseur Agronomique tab's own date range, so the
+  // advanced analysis can factor in irrigation/substrate conditions (VWC, EC, slab/plant weight)
+  // day by day alongside the climate data.
+  const agroFertiChartData = useMemo(() => {
+    if (Object.keys(agroFertiRawDataMap).length === 0) return [];
+    const bins: { [timeMs: number]: any } = {};
+    // agroAnalysisKeys, not fertiSelectedKeys - agroFertiRawDataMap is fetched with the same
+    // broader pool as agroRawDataMap (see agroAnalysisKeys above), so a role-tagged sensor not
+    // ticked FERTI must still be binned here or it's fetched for nothing.
+    agroAnalysisKeys.forEach(key => {
+      const readings = (agroFertiRawDataMap[key] || []).filter((r: any) => r && r.value !== null && r.value !== undefined && !isNaN(Number(r.value)));
+      readings.forEach((r: any) => {
+        const date = new Date(r.time);
+        if (isNaN(date.getTime())) return;
+        date.setSeconds(0, 0);
+        const timeMs = date.getTime();
+        if (!bins[timeMs]) {
+          bins[timeMs] = { time: timeMs };
+        }
+        bins[timeMs][key] = Number(r.value);
+      });
+    });
+    return Object.values(bins).sort((a: any, b: any) => a.time - b.time);
+  }, [agroFertiRawDataMap, agroAnalysisKeys]);
+
+  // Per-day averages of every Ferti Irrigation sensor, keyed by the same dateStr used to group
+  // agroChartData - the join key between the two datasets in dynamicAgronomicData below.
+  const agroFertiDailyAverages = useMemo(() => {
+    const result: { [dateStr: string]: { [key: string]: number } } = {};
+    if (agroFertiChartData.length === 0) return result;
+    const byDay: { [dateStr: string]: any[] } = {};
+    agroFertiChartData.forEach((row: any) => {
+      const dateStr = getStableDateStr(new Date(row.time));
+      if (!byDay[dateStr]) byDay[dateStr] = [];
+      byDay[dateStr].push(row);
+    });
+    Object.keys(byDay).forEach(dateStr => {
+      const rows = byDay[dateStr];
+      const dayAvgs: { [key: string]: number } = {};
+      agroAnalysisKeys.forEach(key => {
+        const valid = rows.filter(r => r[key] !== undefined && r[key] !== null && !isNaN(Number(r[key])));
+        if (valid.length > 0) {
+          dayAvgs[key] = valid.reduce((s, r) => s + Number(r[key]), 0) / valid.length;
+        }
+      });
+      result[dateStr] = dayAvgs;
+    });
+    return result;
+  }, [agroFertiChartData, agroAnalysisKeys]);
+
   // Debounced state update to make Brush dragging butter-smooth
   const updateZoomTimeRangeDebounced = useMemo(() => {
     let timer: NodeJS.Timeout;
@@ -1309,186 +2257,64 @@ export default function AranetUnifiedDashboard() {
   }, [startDate, endDate]);
 
   // Merge datasets into a single chart structure based on absolute timestamp alignment
-  const chartData = useMemo(() => {
-    if (Object.keys(rawDataMap).length === 0) return [];
+  const chartData = useMemo(
+    () => buildChartRows(rawDataMap, selectedKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, manualDrops, timeStep),
+    [rawDataMap, selectedKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, timeStep, manualDrops]
+  );
 
-    // Dynamically adjust step (in minutes) based on requested date range or use selected override to optimize Recharts rendering
-    let step = 5; 
-    if (timeStep !== "auto") {
-      step = Number(timeStep);
-    } else {
-      if (apiDaysRequested > 14) {
-        step = 60; // 1 hour step
-      } else if (apiDaysRequested > 7) {
-        step = 30; // 30 min step
-      } else if (apiDaysRequested > 3) {
-        step = 15; // 15 min step
-      } else if (apiDaysRequested > 1) {
-        step = 10; // 10 min step
-      } else {
-        step = 5;  // 5 min step (maximum detail for single day)
-      }
-    }
+  // Analyseur Agronomique keeps its own date range (agroRawDataMap, fetched separately below)
+  // so browsing a different period there never changes what the Climat/Croissance chart shows.
+  // The detected movements are captured into a ref here (via buildChartRows' out-param) so
+  // dynamicAgronomicData below can reuse them instead of re-running the whole detection pass
+  // (MAD + sliding window + per-cluster stabilization search) a second time on every recompute.
+  const agroMovementsRef = useRef<WeightDropCandidate[]>([]);
+  const agroChartData = useMemo(() => {
+    const movementsOut: WeightDropCandidate[] = [];
+    // Must process agroAnalysisKeys here, not selectedKeys - agroRawDataMap is now fetched using
+    // agroAnalysisKeys (every role-tagged sensor + the weight/gain sensors, independent of chart
+    // display selection - see agroAnalysisKeys above). Processing only selectedKeys would silently
+    // drop the plant_weight_gain column (and its drop-detection/correction) whenever "Cumulative
+    // Gain" isn't ticked for Climat/Croissance display, breaking the correction for the analysis
+    // even though the data was actually fetched.
+    const rows = buildChartRows(agroRawDataMap, agroAnalysisKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, manualDrops, timeStep, movementsOut);
+    agroMovementsRef.current = movementsOut;
+    return rows;
+  }, [agroRawDataMap, agroAnalysisKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, timeStep, manualDrops]);
 
-    // Apply smoothing if enabled for each sensor
-    const smoothedDataMap: { [key: string]: { readings: any[], rawValues: number[] } } = {};
-    selectedKeys.forEach((key) => {
-      let readings = rawDataMap[key] || [];
-      // Clean up values: filter out null, undefined or non-numeric values (NaN)
-      readings = readings.filter((r: any) => r && r.value !== null && r.value !== undefined && !isNaN(Number(r.value)));
-      
-      const config = metricConfigs[key];
-      const isSmooth = config?.smooth === true || config?.smooth === "true";
-      let windowSize = Number(config?.sgWindow || 9);
-      
-      // Savitzky-Golay requires an odd window size
-      if (windowSize % 2 === 0) {
-        windowSize += 1;
-      }
-
-      const rawValues = readings.map((r: any) => {
-        if (key === "plant_weight_gain") {
-          const divisor = (plantsOnScale && plantsOnScale > 0) ? plantsOnScale : 6;
-          const multiplier = (densityPerM2 && densityPerM2 > 0) ? densityPerM2 : 2.5;
-          return (r.value / divisor) * multiplier;
-        }
-        return r.value;
-      });
-
-      if (isSmooth && readings.length > 0) {
-        const smoothedValues = applySavitzkyGolay(rawValues, windowSize, 2);
-        smoothedDataMap[key] = {
-          readings: readings.map((r: any, idx: number) => ({
-            ...r,
-            value: smoothedValues[idx]
-          })),
-          rawValues
-        };
-      } else {
-        smoothedDataMap[key] = {
-          readings: readings.map((r: any, idx: number) => ({
-            ...r,
-            value: rawValues[idx]
-          })),
-          rawValues
-        };
-      }
-    });
-
-    const bins: { [key: number]: any } = {};
-
-    selectedKeys.forEach((key) => {
-      const entry = smoothedDataMap[key];
-      const readings = entry?.readings || [];
-      readings.forEach((r, idx) => {
-        const date = new Date(r.time);
-        if (isNaN(date.getTime())) return;
-        
-        // Align minutes to the nearest step to group all sensors into matching intervals
-        const mins = date.getMinutes();
-        const binnedMins = Math.round(mins / step) * step;
-        date.setMinutes(binnedMins, 0, 0);
-        const timeMs = date.getTime();
-
-        if (!bins[timeMs]) {
-          bins[timeMs] = {
-            time: timeMs,
-            formattedTime: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            formattedDate: date.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          };
-        }
-        bins[timeMs][key] = r.value;
-        bins[timeMs][`${key}_raw`] = entry.rawValues[idx];
-        if (key === "plant_weight_gain" && r.rawScaleWeight !== undefined) {
-          bins[timeMs]["rawScaleWeight"] = r.rawScaleWeight;
-        }
-      });
-    });
-
-    const sortedRows = Object.values(bins).sort((a: any, b: any) => a.time - b.time);
-
-    // Group sortedRows by local date string to detect and apply corrections for harvests/leaf thinning
-    const dailyRowsMap: { [dateStr: string]: any[] } = {};
-    sortedRows.forEach(row => {
-      const d = new Date(row.time);
-      const dateStr = getStableDateStr(d);
-      if (!dailyRowsMap[dateStr]) dailyRowsMap[dateStr] = [];
-      dailyRowsMap[dateStr].push(row);
-    });
-
-    // Detect and apply curve smoothing for each day
-    Object.keys(dailyRowsMap).forEach(dateStr => {
-      const dayRows = dailyRowsMap[dateStr];
-      const eventType = dailyEvents[dateStr] || "none";
-      
-      if (eventType === "harvest" || eventType === "thinning" || eventType === "descent") {
-        let dropTimeMs = 0;
-        let maxDropKg = 0;
-        
-        const manualDrop = manualDrops[dateStr];
-        if (manualDrop) {
-          const parts = dateStr.split("/");
-          const dayP = Number(parts[0]);
-          const monthP = Number(parts[1]) - 1;
-          const yearP = Number(parts[2]);
-          const timeParts = manualDrop.suddenDropTime.split(":");
-          const hourP = Number(timeParts[0] || 12);
-          const minP = Number(timeParts[1] || 0);
-          const dropDate = new Date(yearP, monthP, dayP, hourP, minP);
-          dropTimeMs = dropDate.getTime();
-        } else {
-          // Locate the timestamp and size of the largest drop
-          for (let i = 1; i < dayRows.length; i++) {
-            const prevVal = Number(dayRows[i - 1]["plant_weight_gain"]);
-            const currVal = Number(dayRows[i]["plant_weight_gain"]);
-            if (!isNaN(prevVal) && !isNaN(currVal)) {
-              const diff = currVal - prevVal;
-              if (diff < -0.015) { // drop of > 15 g/m²
-                const absDiff = Math.abs(diff);
-                if (absDiff > maxDropKg) {
-                  maxDropKg = absDiff;
-                  dropTimeMs = dayRows[i].time;
-                }
-              }
-            }
-          }
-        }
-        
-        // Add back the adjusted value to all values from the drop moment until midnight
-        if (dropTimeMs > 0) {
-          const savedAdj = dailyAdjustedWeights[dateStr];
-          const savedAdjNum = Number(savedAdj);
-          const adjKg = (savedAdj !== undefined && !isNaN(savedAdjNum)) 
-            ? (savedAdjNum / 1000.0) 
-            : (isNaN(maxDropKg) ? 0 : maxDropKg);
-          
-          for (let i = 0; i < dayRows.length; i++) {
-            if (dayRows[i].time >= dropTimeMs && dayRows[i]["plant_weight_gain"] !== undefined) {
-              dayRows[i]["plant_weight_gain"] = Number(dayRows[i]["plant_weight_gain"]) + adjKg;
-            }
-          }
-        }
-      }
-    });
-
-    return sortedRows;
-  }, [rawDataMap, selectedKeys, metricConfigs, plantsOnScale, densityPerM2, apiDaysRequested, zoomTimeRange, dailyEvents, dailyAdjustedWeights, timeStep, manualDrops]);
-
-  // Dynamic Advanced Agronomic analysis based on mapped chart data to calculate loss of cumulative gain
+  // Dynamic Advanced Agronomic analysis based on the Analyseur Agronomique tab's own,
+  // independent date range (agroChartData) - not the Climat/Croissance chart's range.
   const dynamicAgronomicData = useMemo(() => {
-    if (chartData.length === 0) return [];
-    
-    // Group chartData by date string
+    if (agroChartData.length === 0) return [];
+
+    // Group agroChartData by date string
     const daysMap: { [dateStr: string]: any[] } = {};
-    chartData.forEach(row => {
+    agroChartData.forEach(row => {
       const d = new Date(row.time);
       const dateStr = getStableDateStr(d);
       if (!daysMap[dateStr]) daysMap[dateStr] = [];
       daysMap[dateStr].push(row);
     });
 
+    // Ferti Irrigation rows (substrate VWC/EC, slab/plant weight), grouped by the same dateStr
+    // join key, so every audit/average helper below sees both datasets as one continuous "rows"
+    // list per day - the advanced analysis isn't climate-only.
+    const daysMapFerti: { [dateStr: string]: any[] } = {};
+    agroFertiChartData.forEach((row: any) => {
+      const dateStr = getStableDateStr(new Date(row.time));
+      if (!daysMapFerti[dateStr]) daysMapFerti[dateStr] = [];
+      daysMapFerti[dateStr].push(row);
+    });
+
+    // Every drop/rise across the whole continuous chart range was already detected once while
+    // building agroChartData above (agroMovementsRef) - reused here instead of re-running
+    // detectWeightMovements a second time on the same data. Manually-declared drops are merged
+    // in below, keyed per-drop so several the same day are each tracked instead of only the max.
+    const dropsByIdAllDays: { [id: string]: WeightDropCandidate } = {};
+    agroMovementsRef.current.forEach(d => { dropsByIdAllDays[d.id] = d; });
+    const allDropsSorted = Object.values(dropsByIdAllDays).sort((a, b) => a.time - b.time);
+
     return Object.keys(daysMap).map((dateStr, index) => {
-      const rows = daysMap[dateStr];
+      const rows = [...daysMap[dateStr], ...(daysMapFerti[dateStr] || [])];
       const audits: any[] = [];
       let lostPercent = 0;
       let score = 100;
@@ -1515,12 +2341,17 @@ export default function AranetUnifiedDashboard() {
         return sorted[sorted.length - 1][key];
       };
 
+      // Night windows are commonly expressed as e.g. 21h->6h, which wraps past midnight - a plain
+      // "hr >= start && hr < end" can never be true for such a range (no hour is both >=21 and <6),
+      // so every "night" stat silently returned null before this handled the wraparound case.
+      const isHourInRange = (hr: number, startHour: number, endHour: number) =>
+        startHour <= endHour ? (hr >= startHour && hr < endHour) : (hr >= startHour || hr < endHour);
+
       const getStatsForTimeRange = (key: string, startHour: number, endHour: number) => {
         const valid = rows.filter(r => {
           if (r[key] === undefined || r[key] === null || isNaN(r[key])) return false;
-          const d = new Date(r.time);
-          const hr = d.getHours();
-          return hr >= startHour && hr < endHour;
+          const hr = new Date(r.time).getHours();
+          return isHourInRange(hr, startHour, endHour);
         });
         if (valid.length === 0) return null;
         const avg = valid.reduce((sum, r) => sum + r[key], 0) / valid.length;
@@ -1528,22 +2359,111 @@ export default function AranetUnifiedDashboard() {
         return { avg, max: Math.max(...values), min: Math.min(...values) };
       };
 
+      // A flat 24h (or even flat day/night) average can hide the actual shape of the curve -
+      // e.g. a chassis opened wide for 2h at midday and shut the rest of the day averages out
+      // to a small, meaningless number. This looks at the actual trend across the window
+      // (optionally restricted to an hour range) by comparing the first third of readings to
+      // the last third, so audits can reason about "rising/falling/stable during the day"
+      // instead of a single blended number.
+      const getTrend = (key: string, startHour?: number, endHour?: number) => {
+        const valid = rows
+          .filter(r => {
+            if (r[key] === undefined || r[key] === null || isNaN(r[key])) return false;
+            if (startHour === undefined || endHour === undefined) return true;
+            return isHourInRange(new Date(r.time).getHours(), startHour, endHour);
+          })
+          .sort((a, b) => a.time - b.time);
+        if (valid.length < 6) return null;
+
+        const third = Math.max(1, Math.floor(valid.length / 3));
+        const firstSlice = valid.slice(0, third);
+        const lastSlice = valid.slice(-third);
+        const firstAvg = firstSlice.reduce((s, r) => s + r[key], 0) / firstSlice.length;
+        const lastAvg = lastSlice.reduce((s, r) => s + r[key], 0) / lastSlice.length;
+        const allValues = valid.map(r => r[key]);
+        const overallAvg = allValues.reduce((s, v) => s + v, 0) / allValues.length;
+        const overallMax = Math.max(...allValues);
+        const overallMin = Math.min(...allValues);
+
+        const delta = lastAvg - firstAvg;
+        // Relative to the window's own amplitude, not an arbitrary fixed unit, so this behaves
+        // consistently whether the metric is ppm, %, °C or m/s.
+        const amplitude = Math.max(overallMax - overallMin, 0.001);
+        const relativeChange = delta / amplitude;
+
+        let trend: "hausse" | "baisse" | "stable" = "stable";
+        if (relativeChange > 0.2) trend = "hausse";
+        else if (relativeChange < -0.2) trend = "baisse";
+
+        return { trend, firstAvg, lastAvg, overallAvg, overallMax, overallMin };
+      };
+
+      // Sensor category detection: the standardized "Rôle Agronomique" tag (set in Sélection des
+      // données) is authoritative when present - a custom Priva point named "priva_custom_xxxx"
+      // has no readable substring, so relying on key-name matching alone made the audit claim
+      // data was "missing" even when the sensor was selected and tagged. Untagged/legacy sensors
+      // still fall back to name-based matching so nothing regresses for users who haven't tagged yet.
+      const keysByRole = (roles: string[], fallbackTest: (k: string) => boolean) => {
+        const tagged = agroAnalysisKeys.filter(k => roles.includes(metricConfigs[k]?.agroRole));
+        const untaggedFallback = agroAnalysisKeys.filter(k => {
+          const role = metricConfigs[k]?.agroRole;
+          return (!role || role === "none") && fallbackTest(k);
+        });
+        return [...tagged, ...untaggedFallback];
+      };
+
       // Extract basic averages
-      const tempKeys = selectedKeys.filter(k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
-      const tempOutKeys = selectedKeys.filter(k => k.toLowerCase().includes("temp") && (k.toLowerCase().includes("out") || k.toLowerCase().includes("ext")));
-      const vpdKeys = selectedKeys.filter(k => k.toLowerCase().includes("vpd"));
-      const rhKeys = selectedKeys.filter(k => (k.toLowerCase().includes("rh") || k.toLowerCase().includes("humidity") || k.toLowerCase().includes("hum_measured")) && !k.toLowerCase().includes("out"));
-      const wcKeys = selectedKeys.filter(k => k.toLowerCase().includes("wc") || k.toLowerCase().includes("vwc"));
-      const radKeys = selectedKeys.filter(k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
-      const windKeys = selectedKeys.filter(k => k.toLowerCase().includes("wind"));
+      const tempKeys = keysByRole(["temp_serre"], k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
+      const tempOutKeys = keysByRole(["temp_exterieure"], k => k.toLowerCase().includes("temp") && (k.toLowerCase().includes("out") || k.toLowerCase().includes("ext")));
+      const vpdKeys = keysByRole(["vpd_haut"], k => k.toLowerCase().includes("vpd"));
+      const rainKeys = keysByRole(["pluie"], k => k.toLowerCase().includes("rain") || k.toLowerCase().includes("pluie"));
+      const rhKeys = keysByRole(["hr_serre"], k => (k.toLowerCase().includes("rh") || k.toLowerCase().includes("humidity") || k.toLowerCase().includes("hum_measured")) && !k.toLowerCase().includes("out"));
+      const rhOutKeys = keysByRole(["hr_exterieure"], k => k.toLowerCase().includes("hum_out") || (k.toLowerCase().includes("rh") && k.toLowerCase().includes("out")));
+      // Substrate VWC/EC sensors are very often only checked FERTI (not CLIMAT) in "Sélection
+      // des données" now that visibility is per-chart - so this audit must look at both
+      // selections, not selectedKeys alone, or it silently goes "Inactif" for anyone using the
+      // Ferti Irrigation tab as intended instead of duplicating the sensor onto Climat/Croissance.
+      // Same tag-first-then-name-fallback logic as keysByRole, but scoped to agroAnalysisKeys
+      // regardless of which chart (if any) a sensor happens to be checked on - the Ferti
+      // Irrigation "Rôle Agronomique" subcategory (EC pain, Poids du pain, Consommation d'eau,
+      // T°C pain) is set on sensors that are very often FERTI-only or not displayed at all.
+      const keysByRoleAll = (roles: string[], fallbackTest: (k: string) => boolean) => {
+        const tagged = agroAnalysisKeys.filter(k => roles.includes(metricConfigs[k]?.agroRole));
+        const untaggedFallback = agroAnalysisKeys.filter(k => {
+          const role = metricConfigs[k]?.agroRole;
+          return (!role || role === "none") && fallbackTest(k);
+        });
+        return [...tagged, ...untaggedFallback];
+      };
+      const wcKeys = keysByRoleAll(["humidite_pain"], k => k.toLowerCase().includes("wc") || k.toLowerCase().includes("vwc"));
+      const ecKeys = keysByRoleAll(["ec_pain"], k => k.toLowerCase().includes("ec_wc_11") || k.toLowerCase().includes("pore_ec"));
+      const slabWeightKeys = keysByRoleAll(["poids_pain"], k => k.toLowerCase().includes("slab_weight"));
+      const substrateTempKeys = keysByRoleAll(["temp_pain"], k => k.toLowerCase().includes("ec_wc_1") && !k.toLowerCase().includes("ec_wc_10") && !k.toLowerCase().includes("ec_wc_11"));
+      const waterConsumptionKeys = keysByRoleAll(["consommation_eau"], () => false);
+      const radKeys = keysByRole(["radiation_instantanee"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
+      const windKeys = keysByRole(["vitesse_vent"], k => k.toLowerCase().includes("wind"));
+      const co2Keys = keysByRole(["co2"], k => k.toLowerCase().includes("co2"));
+      const grosTuyauKeys = keysByRole(["gros_tuyau"], () => false);
+      const chassisAbriteKeys = keysByRole(["position_chassis_abrite"], () => false);
+      const chassisExposeKeys = keysByRole(["position_chassis_expose"], () => false);
 
       const tempAvg = tempKeys.length > 0 ? getAverage(tempKeys[0]) : null;
       const tempOutAvg = tempOutKeys.length > 0 ? getAverage(tempOutKeys[0]) : null;
       const vpdAvg = vpdKeys.length > 0 ? getAverage(vpdKeys[0]) : null;
       const rhAvg = rhKeys.length > 0 ? getAverage(rhKeys[0]) : null;
+      const rhOutAvg = rhOutKeys.length > 0 ? getAverage(rhOutKeys[0]) : null;
       const wcAvg = wcKeys.length > 0 ? getAverage(wcKeys[0]) : null;
+      const ecAvg = ecKeys.length > 0 ? getAverage(ecKeys[0]) : null;
+      const slabWeightAvg = slabWeightKeys.length > 0 ? getAverage(slabWeightKeys[0]) : null;
+      const substrateTempAvg = substrateTempKeys.length > 0 ? getAverage(substrateTempKeys[0]) : null;
+      const waterConsumptionAvg = waterConsumptionKeys.length > 0 ? getAverage(waterConsumptionKeys[0]) : null;
       const radAvg = radKeys.length > 0 ? getAverage(radKeys[0]) : null;
       const windAvg = windKeys.length > 0 ? getAverage(windKeys[0]) : null;
+      const co2Avg = co2Keys.length > 0 ? getAverage(co2Keys[0]) : null;
+      const rainAvg = rainKeys.length > 0 ? getAverage(rainKeys[0]) : null;
+      const grosTuyauAvg = grosTuyauKeys.length > 0 ? getAverage(grosTuyauKeys[0]) : null;
+      const chassisAbriteAvg = chassisAbriteKeys.length > 0 ? getAverage(chassisAbriteKeys[0]) : null;
+      const chassisExposeAvg = chassisExposeKeys.length > 0 ? getAverage(chassisExposeKeys[0]) : null;
 
       // 1. ADVANCED INDICATOR: Light/Temperature Ratio (Rapport Lumière / Température 24h)
       if (tempAvg !== null && radAvg !== null) {
@@ -1752,6 +2672,157 @@ export default function AranetUnifiedDashboard() {
         }
       }
 
+      // 6. CO2 enrichment vs available light (carbon limitation of photosynthesis). A flat 24h
+      // CO2 average is meaningless here: CO2 injection only runs (and only matters) during
+      // daylight photosynthesis, while nighttime CO2 naturally drifts up from plant/soil
+      // respiration with no injection running - blending the two masks the real daytime level.
+      // Compared against the day-window radiation average for the same reason (a 24h radiation
+      // average diluted by nighttime zeros understates how much light was actually available).
+      const co2DayStats = co2Keys.length > 0 ? getStatsForTimeRange(co2Keys[0], 8, 18) : null;
+      const co2NightStats = co2Keys.length > 0 ? getStatsForTimeRange(co2Keys[0], 21, 6) : null;
+      const co2DayTrend = co2Keys.length > 0 ? getTrend(co2Keys[0], 8, 18) : null;
+      const radDayStats = radKeys.length > 0 ? getStatsForTimeRange(radKeys[0], 8, 18) : null;
+
+      // Chassis opening computed here (day-window, 8h-18h) so the CO2 audit below can already use
+      // it - once either side of the roof vents is open beyond ~15%, CO2 escapes to the outside
+      // faster than injection can compensate, so a low reading is explained by ventilation, not by
+      // an injection failure, and must stop being flagged as a limiting factor.
+      const chassisAbriteDayStats = chassisAbriteKeys.length > 0 ? getStatsForTimeRange(chassisAbriteKeys[0], 8, 18) : null;
+      const chassisExposeDayStats = chassisExposeKeys.length > 0 ? getStatsForTimeRange(chassisExposeKeys[0], 8, 18) : null;
+      const ventOpenDayAvg = Math.max(chassisAbriteDayStats?.avg ?? 0, chassisExposeDayStats?.avg ?? 0);
+      const isVentedOpenForCo2 = (chassisAbriteDayStats !== null || chassisExposeDayStats !== null) && ventOpenDayAvg > 15;
+
+      if (co2DayStats !== null && radDayStats !== null) {
+        const co2Day = co2DayStats.avg;
+        const radDay = radDayStats.avg;
+        const expectedCo2 = radDay > 150 ? 750 : radDay > 60 ? 650 : 550;
+        const trendNote = co2DayTrend?.trend === "baisse"
+          ? ` En baisse au fil de la journée (${Math.round(co2DayTrend.firstAvg)} → ${Math.round(co2DayTrend.lastAvg)} ppm) : l'injection n'a probablement pas suivi la consommation par la photosynthèse.`
+          : co2DayTrend?.trend === "hausse"
+            ? ` En hausse au fil de la journée (${Math.round(co2DayTrend.firstAvg)} → ${Math.round(co2DayTrend.lastAvg)} ppm).`
+            : "";
+        if (co2Day < expectedCo2 - 80 && isVentedOpenForCo2) {
+          // Ouvrants ouverts au-delà de 15% en journée : le CO2 mesuré bas est une conséquence
+          // normale de la ventilation (balayage vers l'extérieur), pas un facteur limitant en soi -
+          // ne pas pénaliser le score ni le pointer comme cause du gain manqué.
+          audits.push({
+            name: "Enrichissement CO2 (Jour 8h-18h)",
+            applied: Math.round(co2Day),
+            targetMin: expectedCo2 - 50,
+            targetMax: expectedCo2 + 100,
+            unit: "ppm",
+            status: "optimal",
+            impact: `CO2 diurne bas (${Math.round(co2Day)} ppm) mais expliqué par l'ouverture des ouvrants (${Math.round(ventOpenDayAvg)}% en moyenne diurne, >15%) : dilution normale par aération, pas un facteur limitant.${trendNote}`,
+            origin: "Ventilation (non pénalisé)"
+          });
+        } else if (co2Day < expectedCo2 - 80) {
+          lostPercent += 10;
+          score -= 10;
+          audits.push({
+            name: "Enrichissement CO2 (Jour 8h-18h)",
+            applied: Math.round(co2Day),
+            targetMin: expectedCo2 - 50,
+            targetMax: expectedCo2 + 100,
+            unit: "ppm",
+            status: "low",
+            impact: `CO2 diurne mesuré (${Math.round(co2Day)} ppm, moyenne 8h-18h) sous la cible attendue pour ce niveau de rayonnement diurne (${Math.round(radDay)} W/m²).${trendNote}`,
+            origin: "Technique (Injection CO2 insuffisante ou fuite par aération)"
+          });
+          physiologicalReasons.push("Carbonication insuffisante : à ce niveau de lumière, la photosynthèse est bridée par le manque de CO2 disponible plutôt que par la lumière elle-même, ce qui plafonne artificiellement le gain de biomasse malgré un climat par ailleurs favorable.");
+          actionPlans.push(`Augmenter la consigne d'injection CO2 vers ${expectedCo2} ppm en journée, en vérifiant que l'ouverture des ouvrants ne dilue pas l'apport.`);
+        } else {
+          audits.push({
+            name: "Enrichissement CO2 (Jour 8h-18h)",
+            applied: Math.round(co2Day),
+            targetMin: expectedCo2 - 50,
+            targetMax: expectedCo2 + 100,
+            unit: "ppm",
+            status: "optimal",
+            impact: `Niveau de CO2 diurne cohérent avec le rayonnement disponible.${trendNote}`,
+            origin: "Optimal"
+          });
+        }
+      } else {
+        audits.push({ name: "Enrichissement CO2 (Inactif)", applied: null, status: "missing", impact: "Sélectionnez et taguez (Rôle Agronomique : CO2) un capteur de CO2 pour auditer la carbonication.", origin: "-" });
+      }
+
+      // 7. Ventilation management: chassis opening (abrité/exposé) vs wind speed - open chassis on the
+      // wind-exposed side during strong wind risks cold-draft leaf stress even if the greenhouse is hot.
+      // Chassis are normally shut at night regardless of wind, so a flat 24h average opening
+      // (e.g. "31% open on average over the day") is meaningless - it says nothing about whether
+      // the chassis was dangerously wide open during an actual daytime wind event. Restricted to
+      // the daylight window (8h-18h, when ventilation actually operates) instead.
+      const windDayStats = windKeys.length > 0 ? getStatsForTimeRange(windKeys[0], 8, 18) : null;
+
+      if (chassisExposeDayStats !== null && windDayStats !== null) {
+        const chassisExposeDay = chassisExposeDayStats.avg;
+        const chassisExposeMax = chassisExposeDayStats.max;
+        const windDay = windDayStats.avg;
+        const windMax = windDayStats.max;
+        if (windMax > 4.5 && chassisExposeMax > 30) {
+          lostPercent += 8;
+          score -= 8;
+          audits.push({
+            name: "Ventilation / Vent (Jour 8h-18h)",
+            applied: Math.round(chassisExposeMax),
+            targetMin: 0,
+            targetMax: 20,
+            unit: "% (côté exposé, pic diurne)",
+            status: "high",
+            impact: `Chassis exposé ouvert jusqu'à ${Math.round(chassisExposeMax)}% en journée (moyenne diurne ${Math.round(chassisExposeDay)}%) sous un pic de vent à ${windMax.toFixed(1)} m/s (moyenne diurne ${windDay.toFixed(1)} m/s) : risque de stress par courant d'air froid direct sur le feuillage.`,
+            origin: "Technique (Ouverture du mauvais côté sous vent fort)"
+          });
+          physiologicalReasons.push("Stress par courant d'air : l'ouverture du chassis côté exposé au vent par vent fort refroidit brutalement le feuillage localement, perturbant la transpiration et la régulation stomatique sans bénéfice thermique global.");
+          actionPlans.push("Privilégier l'ouverture du chassis abrité (côté sous le vent) et restreindre le chassis exposé tant que le vent reste fort.");
+        } else {
+          audits.push({
+            name: "Ventilation / Vent (Jour 8h-18h)",
+            applied: Math.round(chassisExposeDay),
+            targetMin: 0,
+            targetMax: 30,
+            unit: "% (côté exposé, moyenne diurne)",
+            status: "optimal",
+            impact: "Gestion de l'ouverture du chassis en journée cohérente avec le vent mesuré.",
+            origin: "Optimal"
+          });
+        }
+      } else {
+        audits.push({ name: "Ventilation / Vent (Inactif)", applied: null, status: "missing", impact: "Sélectionnez et taguez la position du chassis exposé et la vitesse du vent pour auditer la ventilation.", origin: "-" });
+      }
+
+      // 8. Heating pipe rail (Gros Tuyau) vs outdoor temperature - underheating on cold days
+      // slows fruit development even when the average indoor temperature looks acceptable.
+      if (grosTuyauAvg !== null && tempOutAvg !== null) {
+        if (tempOutAvg < 10 && grosTuyauAvg < 35) {
+          lostPercent += 8;
+          score -= 8;
+          audits.push({
+            name: "Chauffage Gros Tuyau",
+            applied: Math.round(grosTuyauAvg),
+            targetMin: 35,
+            targetMax: 55,
+            unit: "°C",
+            status: "low",
+            impact: `Température du gros tuyau basse (${Math.round(grosTuyauAvg)}°C) alors qu'il fait froid dehors (${tempOutAvg.toFixed(1)}°C).`,
+            origin: "Technique (Consigne de chauffage insuffisante)"
+          });
+          actionPlans.push("Augmenter la consigne de chauffage du gros tuyau par temps froid pour soutenir le développement des fruits.");
+        } else {
+          audits.push({
+            name: "Chauffage Gros Tuyau",
+            applied: Math.round(grosTuyauAvg),
+            targetMin: 30,
+            targetMax: 55,
+            unit: "°C",
+            status: "optimal",
+            impact: "Chauffage cohérent avec la température extérieure.",
+            origin: "Optimal"
+          });
+        }
+      } else {
+        audits.push({ name: "Chauffage Gros Tuyau (Inactif)", applied: null, status: "missing", impact: "Sélectionnez et taguez le gros tuyau et la température extérieure pour auditer le chauffage.", origin: "-" });
+      }
+
       // Look up selected radiation sum key dynamically (in J/cm²)
       const radSumKey = selectedKeys.find(key => {
         const config = metricConfigs[key];
@@ -1778,93 +2849,22 @@ export default function AranetUnifiedDashboard() {
       // Lost potential in g/m² due to poor crop steering
       const lostGainGrams = yieldPotentialGrams !== null ? Number((yieldPotentialGrams * (lostPercent / 100)).toFixed(1)) : 0;
 
-      // Calculate actual weight gain and detect sudden drops
-      const weightKeys = selectedKeys.filter(k => k === "plant_weight_gain");
+      // Every drop attributed to this calendar day (already detected + merged with manual
+      // entries above, across the whole continuous range so none are missed at day boundaries).
+      const dayDrops = allDropsSorted.filter(d => d.dateStr === dateStr);
       let actualGain = 0;
-      let suddenDropTime: string | null = null;
-      let suddenDropTs: number | null = null;
-      let suddenDropVal = 0;
-      let suggestedCorrectionGrams = 0;
 
-      const manualDropForDay = manualDrops[dateStr];
+      // Kept for backward-compatible display: the day's single largest drop.
+      const worstDrop = dayDrops.length > 0
+        ? dayDrops.reduce((worst, d) => (d.suddenDropVal > worst.suddenDropVal ? d : worst), dayDrops[0])
+        : null;
+      const suddenDropTime: string | null = worstDrop ? worstDrop.timeStr : null;
+      const suddenDropTs: number | null = worstDrop ? worstDrop.time : null;
+      const suddenDropVal = worstDrop ? worstDrop.suddenDropVal : 0;
+      const suggestedCorrectionGrams = worstDrop ? worstDrop.suggestedCorrectionGrams : 0;
 
-      if (manualDropForDay) {
-        suddenDropVal = manualDropForDay.suddenDropVal;
-        suggestedCorrectionGrams = manualDropForDay.suggestedCorrectionGrams;
-        suddenDropTime = manualDropForDay.suddenDropTime;
-        
-        const parts = dateStr.split("/");
-        const dayP = Number(parts[0]);
-        const monthP = Number(parts[1]) - 1;
-        const yearP = Number(parts[2]);
-        const timeParts = suddenDropTime.split(":");
-        const hourP = Number(timeParts[0] || 12);
-        const minP = Number(timeParts[1] || 0);
-        const dropDate = new Date(yearP, monthP, dayP, hourP, minP);
-        suddenDropTs = dropDate.getTime();
-      } else if (weightKeys.length > 0) {
-        const key = weightKeys[0];
-        const divisor = (plantsOnScale && plantsOnScale > 0) ? plantsOnScale : 6;
-        const multiplier = (densityPerM2 && densityPerM2 > 0) ? densityPerM2 : 2.5;
-        
-        // Filter rows that have rawScaleWeight
-        const rawReadings = rows.filter(r => r.rawScaleWeight !== undefined && r.rawScaleWeight !== null && !isNaN(Number(r.rawScaleWeight)));
-        
-        if (rawReadings.length > 0) {
-          rawReadings.sort((a, b) => a.time - b.time);
-          
-          for (let i = 1; i < rawReadings.length; i++) {
-            const prevScale = Number(rawReadings[i - 1].rawScaleWeight);
-            const currScale = Number(rawReadings[i].rawScaleWeight);
-            
-            if (!isNaN(prevScale) && !isNaN(currScale) && prevScale > 0) {
-              const scaleDropAbs = prevScale - currScale;
-              
-              // Drop of at least 15 grams on the scale (0.015 kg)
-              if (scaleDropAbs >= 0.015) {
-                const dropTime = rawReadings[i].time;
-                
-                // Check if NOT compensated in the next 30 minutes
-                const thirtyMinsLater = dropTime + 30 * 60 * 1000;
-                const postReadings = rawReadings.filter(r => r.time > dropTime && r.time <= thirtyMinsLater);
-                
-                // If weight doesn't recover to within 5 grams of prevScale, it is non-compensated
-                const threshold = prevScale - 0.005;
-                const isCompensated = postReadings.some(r => Number(r.rawScaleWeight) >= threshold);
-                
-                if (!isCompensated) {
-                  // Compute delta: (average of 15 points of cumulative gain before) - (average of 15 points of cumulative gain after)
-                  const prePoints = rawReadings.filter(r => r.time < dropTime).slice(-15);
-                  const postPoints = rawReadings.filter(r => r.time >= dropTime).slice(0, 15);
-                  
-                  let deltaGramsPerM2 = 0;
-                  const rawKey = `${key}_raw`;
-                  if (prePoints.length > 0 && postPoints.length > 0) {
-                    const avgPre = prePoints.reduce((sum, r) => sum + Number(r[rawKey]), 0) / prePoints.length;
-                    const avgPost = postPoints.reduce((sum, r) => sum + Number(r[rawKey]), 0) / postPoints.length;
-                    const deltaScaleKg = avgPre - avgPost; // Difference in kg/m² of raw cumulative gain
-                    deltaGramsPerM2 = deltaScaleKg * 1000; // Convert to g/m²
-                  } else {
-                    const prevVal = Number(rawReadings[i - 1][rawKey]);
-                    const currVal = Number(rawReadings[i][rawKey]);
-                    deltaGramsPerM2 = (prevVal - currVal) * 1000;
-                  }
-                  
-                  const dropGramsPerM2 = ((prevScale - currScale) / divisor) * multiplier * 1000;
-                  
-                  if (dropGramsPerM2 > suddenDropVal) {
-                    suddenDropVal = Math.round(dropGramsPerM2);
-                    suggestedCorrectionGrams = Math.max(0, Math.round(deltaGramsPerM2));
-                    const dateObj = new Date(dropTime);
-                    suddenDropTime = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    suddenDropTs = dropTime;
-                  }
-                }
-              }
-            }
-          }
-        }
-
+      if (selectedKeys.includes("plant_weight_gain")) {
+        const key = "plant_weight_gain";
         // Calculate actual daily gain using the corrected/smoothed curve values
         const dayReadings = rows.filter(r => r[key] !== undefined && r[key] !== null && !isNaN(Number(r[key])));
         if (dayReadings.length > 0) {
@@ -1887,6 +2887,63 @@ export default function AranetUnifiedDashboard() {
       const overallStatus = score >= 90 ? "Optimal" : score >= 75 ? "Ajustement requis" : "Alerte Climat";
       const statusColor = score >= 90 ? "emerald" : score >= 75 ? "amber" : "rose";
 
+      // Growth-per-light efficiency for this day (g/m² of cumulative gain per J/cm² of radiation).
+      // The best day in the displayed range becomes the benchmark (computed in a second pass below)
+      // to size the potential gain each other day left on the table under the light it actually received.
+      const growthEfficiency = (radiationSumJcm2 !== null && radiationSumJcm2 > 0 && actualGain > 0)
+        ? actualGain / radiationSumJcm2
+        : null;
+
+      // Day-window (8h-18h) stats for the composite "Indice de Performance Agronomique" below -
+      // exposed temperature and light are only meaningful during the hours the plant is actually
+      // photosynthesizing, and substrate dry-back (evening minus morning VWC%) is the best proxy
+      // for real water consumption available from existing sensors (no dosing/flow sensor).
+      const radDayForIndex = radKeys.length > 0 ? getStatsForTimeRange(radKeys[0], 8, 18) : null;
+      const tempDayForIndex = tempKeys.length > 0 ? getStatsForTimeRange(tempKeys[0], 8, 18) : null;
+      const wcEveForIndex = wcKeys.length > 0 ? getStatsForTimeRange(wcKeys[0], 17, 19) : null;
+      const wcMorForIndex = wcKeys.length > 0 ? getStatsForTimeRange(wcKeys[0], 5, 7) : null;
+      const dryBackForIndex = (wcEveForIndex && wcMorForIndex) ? wcEveForIndex.avg - wcMorForIndex.avg : null;
+
+      // Per-time-slot limiting factor: for each of the 5 agronomic windows, which tracked factor
+      // was furthest outside its target range (the IQR of this greenhouse's own best-efficiency
+      // days, from /api/agro-target-ranges) - a concrete "what capped the gain and when" instead
+      // of only a daily-average verdict. Not a claim that the hour itself caused a measurable
+      // amount of lost gain (cumulative gain has no hourly ground truth from a scale reading
+      // alone) - it flags where conditions deviated from the proven-good range.
+      const slotFactorKeys: { field: string; key: string | undefined }[] = [
+        { field: "tempAvg", key: tempKeys[0] },
+        { field: "tempOutAvg", key: tempOutKeys[0] },
+        { field: "vpdAvg", key: vpdKeys[0] },
+        { field: "rhAvg", key: rhKeys[0] },
+        { field: "wcAvg", key: wcKeys[0] },
+        { field: "ecAvg", key: ecKeys[0] },
+        { field: "radAvg", key: radKeys[0] },
+        { field: "windAvg", key: windKeys[0] },
+        { field: "co2Avg", key: co2Keys[0] },
+        { field: "rainAvg", key: rainKeys[0] }
+      ];
+      const limitingFactorsBySlot = AGRO_TIME_SLOTS.map(slot => {
+        let worst: { field: string; value: number; range: { min: number; max: number }; deviation: number } | null = null;
+        slotFactorKeys.forEach(({ field, key }) => {
+          if (!key) return;
+          // The range is specific to THIS slot, not a single daily figure - a factor's target
+          // at Midi genuinely differs from its target at Nuit (light/temperature/substrate
+          // demand vary across the day), so each slot is compared against its own range.
+          const range = agroTargetRanges[field]?.[slot.label];
+          if (!range) return;
+          const stats = getStatsForTimeRange(key, slot.start, slot.end);
+          if (!stats) return;
+          const width = Math.max(range.max - range.min, 0.0001);
+          const outBy = stats.avg < range.min ? range.min - stats.avg : stats.avg > range.max ? stats.avg - range.max : 0;
+          if (outBy <= 0) return;
+          const deviation = outBy / width;
+          if (!worst || deviation > worst.deviation) {
+            worst = { field, value: Number(stats.avg.toFixed(2)), range, deviation };
+          }
+        });
+        return { ...slot, limitingFactor: worst };
+      });
+
       return {
         dateStr,
         day: index + 1,
@@ -1899,15 +2956,186 @@ export default function AranetUnifiedDashboard() {
         suddenDropTs,
         suddenDropVal: isNaN(suddenDropVal) ? 0 : Number(suddenDropVal.toFixed(1)),
         suggestedCorrectionGrams: isNaN(suggestedCorrectionGrams) ? 0 : Math.round(suggestedCorrectionGrams),
+        drops: dayDrops,
         radiationSumJcm2,
+        growthEfficiency,
         yieldPotentialGrams,
         lostPercent,
+        radDayAvg: radDayForIndex?.avg ?? null,
+        tempDayAvg: tempDayForIndex?.avg ?? null,
+        dryBack: dryBackForIndex,
+        limitingFactorsBySlot,
         audits,
         physiologicalExplanation: physiologicalReasons.join(" "),
-        actionPlan: actionPlans
+        actionPlan: actionPlans,
+        // Climate stats + drops bundled up for the AI black-box call, so the request payload
+        // doesn't need to be re-derived from chartData/rawDataMap on every "Analyser avec l'IA" click.
+        aiContext: {
+          tempAvg, tempOutAvg, vpdAvg, rhAvg, wcAvg, ecAvg, radAvg, windAvg, co2Avg, rainAvg,
+          slabWeightAvg, substrateTempAvg, waterConsumptionAvg,
+          // Day/night split and intra-day trend, not just the flat 24h figures above - a 24h
+          // average hides exactly the kind of thing that actually explains growth outcomes
+          // (CO2 depleting over the day, a chassis briefly wide open at midday, etc.).
+          co2DayAvg: co2DayStats?.avg ?? null,
+          co2NightAvg: co2NightStats?.avg ?? null,
+          co2DayTrend: co2DayTrend?.trend ?? null,
+          // Once vents are open beyond ~15% during the day, CO2 dilutes to the outside faster than
+          // injection can compensate - a low CO2 reading is then explained by ventilation, not a
+          // limiting factor in itself, and should not be blamed for a lost gain.
+          co2ExplainedByVentilation: isVentedOpenForCo2,
+          chassisExposeDayAvg: chassisExposeDayStats?.avg ?? null,
+          chassisExposeDayMax: chassisExposeDayStats?.max ?? null,
+          windDayAvg: windDayStats?.avg ?? null,
+          windDayMax: windDayStats?.max ?? null,
+          ruleBasedFindings: audits.map((a: any) => a.impact).filter(Boolean)
+        }
       };
     });
-  }, [chartData, selectedKeys, metricConfigs, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, manualDrops]);
+  }, [agroChartData, agroFertiChartData, selectedKeys, fertiSelectedKeys, metricConfigs, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, manualDrops, agroTargetRanges]);
+
+  // Second pass: benchmark every day against the best light-use-efficiency day observed in the
+  // currently displayed range, so "potential gain" reflects what THIS greenhouse actually proved
+  // capable of recently rather than a fixed, manually-configured ratio.
+  const agronomicDataWithBenchmark = useMemo(() => {
+    if (dynamicAgronomicData.length === 0) return [];
+    const bestEfficiency = dynamicAgronomicData.reduce((best: number, d: any) => {
+      return d.growthEfficiency !== null && d.growthEfficiency > best ? d.growthEfficiency : best;
+    }, 0);
+
+    // Best day-window light sum observed in the displayed range - the reference for "did we get
+    // good light today", proven by this greenhouse rather than a fixed, arbitrary ceiling.
+    const bestRadDayInRange = dynamicAgronomicData.reduce((best: number, d: any) => {
+      return d.radDayAvg !== null && d.radDayAvg > best ? d.radDayAvg : best;
+    }, 0);
+
+    return dynamicAgronomicData.map((d: any) => {
+      const potentialGainBestDay = (bestEfficiency > 0 && d.radiationSumJcm2 !== null)
+        ? Number((bestEfficiency * d.radiationSumJcm2).toFixed(1))
+        : null;
+      const lostGainVsBestDay = potentialGainBestDay !== null
+        ? Math.max(0, Number((potentialGainBestDay - d.actualGain).toFixed(1)))
+        : null;
+      const lostPercentVsBestDay = (potentialGainBestDay !== null && potentialGainBestDay > 0)
+        ? Math.round((lostGainVsBestDay! / potentialGainBestDay) * 100)
+        : null;
+
+      // Every detected weight movement is auto-smoothed now (see buildChartRows), so all of them
+      // are a handled consequence of past growth/logistics rather than a growth problem to
+      // explain - none should surface as a "loss" in this analysis.
+      const validatedDrops: WeightDropCandidate[] = d.drops || [];
+
+      // The agro score must be coherent with the day's actual biomass outcome: the loss of
+      // potential gain vs. the best-efficiency day observed in the range is the primary signal
+      // (when computable), with the rule-based climate score as a fallback/explanatory detail
+      // when radiation data isn't available to compute a biomass-potential-based score.
+      const overallScore = lostPercentVsBestDay !== null
+        ? Math.max(10, Math.round(100 - lostPercentVsBestDay))
+        : d.overallScore;
+      const status = overallScore >= 90 ? "Optimal" : overallScore >= 75 ? "Ajustement requis" : "Alerte Climat";
+      const statusColor = overallScore >= 90 ? "emerald" : overallScore >= 75 ? "amber" : "rose";
+
+      // ULTIMATE DAILY AGRONOMIC PERFORMANCE INDEX: one 0-100 number per day combining light
+      // received, temperature exposure, water/irrigation management (substrate dry-back) and the
+      // resulting biomass gain - so the grower can track it day by day on a single curve and,
+      // when it dips, immediately see which of the four levers was the bottleneck that day
+      // rather than having to cross-reference several separate charts.
+      const lightScore = (d.radDayAvg !== null && bestRadDayInRange > 0)
+        ? Math.min(100, Math.round((d.radDayAvg / bestRadDayInRange) * 100))
+        : null;
+
+      const expectedTempForIndex = d.radDayAvg !== null ? 18.0 + (d.radDayAvg / 100.0) * 1.5 : null;
+      const tempScore = (d.tempDayAvg !== null && expectedTempForIndex !== null)
+        ? Math.max(0, Math.round(100 - Math.abs(d.tempDayAvg - expectedTempForIndex) * 20))
+        : null;
+
+      // Optimal dry-back band is 8-12% (see the Ressuyage Nocturne logic) - a score of 100 at the
+      // center, falling off the further outside the band (over- or under-irrigation both cost points).
+      const waterScore = d.dryBack !== null
+        ? Math.max(0, Math.round(100 - (d.dryBack < 8 ? (8 - d.dryBack) : d.dryBack > 12 ? (d.dryBack - 12) : 0) * 12))
+        : null;
+
+      // The resulting output: how the actual gain compares to what this greenhouse proved
+      // achievable under the same light (already computed above as lostPercentVsBestDay).
+      const biomassScore = lostPercentVsBestDay !== null ? Math.max(0, Math.round(100 - lostPercentVsBestDay)) : null;
+
+      const indexComponents: { label: string; score: number }[] = [];
+      if (lightScore !== null) indexComponents.push({ label: "Lumière reçue", score: lightScore });
+      if (tempScore !== null) indexComponents.push({ label: "Température exposée", score: tempScore });
+      if (waterScore !== null) indexComponents.push({ label: "Irrigation / Eau (dry-back)", score: waterScore });
+      if (biomassScore !== null) indexComponents.push({ label: "Gain de biomasse", score: biomassScore });
+
+      const weights: Record<string, number> = { "Lumière reçue": 0.25, "Température exposée": 0.25, "Irrigation / Eau (dry-back)": 0.2, "Gain de biomasse": 0.3 };
+      const totalWeight = indexComponents.reduce((s, c) => s + weights[c.label], 0);
+      const agroPerformanceIndex = totalWeight > 0
+        ? Math.round(indexComponents.reduce((s, c) => s + c.score * weights[c.label], 0) / totalWeight)
+        : null;
+
+      // The lowest-scoring component is what "bridait" (capped) the gain that day.
+      const limitingComponent = indexComponents.length > 0
+        ? indexComponents.reduce((worst, c) => (c.score < worst.score ? c : worst), indexComponents[0])
+        : null;
+
+      return {
+        ...d,
+        drops: validatedDrops,
+        suddenDropVal: validatedDrops.length > 0
+          ? Math.max(...validatedDrops.map(dr => dr.suddenDropVal))
+          : 0,
+        lightScore,
+        tempScore,
+        waterScore,
+        biomassScore,
+        agroPerformanceIndex,
+        limitingFactorLabel: limitingComponent?.label ?? null,
+        limitingFactorScore: limitingComponent?.score ?? null,
+        bestEfficiencyInRange: bestEfficiency > 0 ? bestEfficiency : null,
+        potentialGainBestDay,
+        lostGainVsBestDay,
+        lostPercentVsBestDay,
+        overallScore,
+        status,
+        statusColor,
+        // Efficiency re-expressed as grams per 100 J/cm² of radiation received, rather than the
+        // raw g/m² per J/cm² decimal (e.g. 0.0234) - matches the "g / 100 J/cm²" unit already
+        // used by the conversion-ratio calibration input above, and reads at a human scale.
+        potentialEfficiencyPer100J: bestEfficiency > 0 ? Number((bestEfficiency * 100).toFixed(2)) : null,
+        realizedEfficiencyPer100J: d.growthEfficiency !== null ? Number((d.growthEfficiency * 100).toFixed(2)) : null
+      };
+    });
+  }, [dynamicAgronomicData, dailyEvents]);
+
+  // Mirror each computed day's summary into Supabase (debounced) so the persistent agronomic
+  // agent's correlation history grows every time this tab is opened with data loaded, instead
+  // of every visit starting from zero. Browser is still the only place that can derive these
+  // from raw sensor data (see plan note on agroRole/calibration state) - this just persists the
+  // result of that computation, it doesn't move the computation itself server-side.
+  const agroSummarySyncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (!isLoaded || agronomicDataWithBenchmark.length === 0) return;
+    if (agroSummarySyncTimeoutRef.current) clearTimeout(agroSummarySyncTimeoutRef.current);
+    agroSummarySyncTimeoutRef.current = setTimeout(() => {
+      const days = agronomicDataWithBenchmark
+        .filter((d: any) => d.dateStr && d.actualGain !== undefined)
+        .map((d: any) => ({
+          dateStr: d.dateStr,
+          actualGain: d.actualGain,
+          radiationSumJcm2: d.radiationSumJcm2,
+          growthEfficiency: d.growthEfficiency,
+          climate: d.aiContext,
+          drops: (d.drops || []).map((drop: WeightDropCandidate) => ({ time: drop.timeStr, valGm2: drop.suddenDropVal })),
+          ruleBasedFindings: d.aiContext?.ruleBasedFindings || []
+        }));
+      if (days.length === 0) return;
+      fetch("/api/agro-daily-summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ days })
+      }).catch(e => console.error("Failed to sync agro daily summaries:", e));
+    }, 1500);
+    return () => {
+      if (agroSummarySyncTimeoutRef.current) clearTimeout(agroSummarySyncTimeoutRef.current);
+    };
+  }, [agronomicDataWithBenchmark, isLoaded]);
 
   const brushIndices = useMemo(() => {
     if (!zoomTimeRange || chartData.length === 0) {
@@ -2026,6 +3254,47 @@ export default function AranetUnifiedDashboard() {
     return Object.values(axesMap);
   }, [visibleChartKeys, metricConfigs]);
 
+  // Same visibility-toggle pattern as visibleChartKeys for Climat/Croissance - fertiSelectedKeys
+  // is what's loaded/fetched, visibleFertiChartKeys is what's actually plotted.
+  const visibleFertiChartKeys = useMemo(() => {
+    return fertiSelectedKeys.filter(k => !hiddenFertiKeysOnChart.includes(k));
+  }, [fertiSelectedKeys, hiddenFertiKeysOnChart]);
+
+  // Same dynamic "group active sensors into shared axes by unit & side" system as Climat/Croissance,
+  // applied to the Ferti Irrigation tab's own (visible) sensor selection.
+  const fertiActiveYAxes = useMemo(() => {
+    const axesMap: {
+      [id: string]: {
+        axisId: string;
+        axis: "left" | "right";
+        unitName: string;
+        keys: string[];
+        color: string;
+      };
+    } = {};
+
+    visibleFertiChartKeys.forEach((key) => {
+      const m = allMetrics.find(item => item.key === key);
+      if (!m) return;
+      const config = metricConfigs[key] || {};
+      const axis = config.axis || "left";
+      const unitObj = m.units.find((u: any) => u.id === config.unit) || m.units[0];
+      const unitName = normalizeUnitName(unitObj.name);
+      const axisId = `${axis}-${unitName}`;
+      const color = config.color || m.color;
+
+      if (!axesMap[axisId]) {
+        axesMap[axisId] = { axisId, axis, unitName, keys: [], color };
+      }
+      axesMap[axisId].keys.push(key);
+    });
+
+    return Object.values(axesMap);
+  }, [visibleFertiChartKeys, metricConfigs]);
+
+  const fertiLeftActiveKeys = visibleFertiChartKeys.filter(k => (metricConfigs[k]?.axis || "left") === "left");
+  const fertiRightActiveKeys = visibleFertiChartKeys.filter(k => (metricConfigs[k]?.axis || "left") === "right");
+
   const firstYAxisId = useMemo(() => {
     if (selectedKeys.length === 0) return undefined;
     const key = selectedKeys[0];
@@ -2071,9 +3340,11 @@ export default function AranetUnifiedDashboard() {
     return null;
   };
 
-  // Group metrics by visibility (filtered by active compartment)
+  // Group metrics by visibility (filtered by active compartment). "Visible" now means selected
+  // for EITHER graph (Climat/Croissance or Ferti Irrigation) - a sensor only ticked FERTI must
+  // still show up on the left, not get stranded on the right as if nothing had been chosen.
   const visibleMetrics = allMetrics.filter(m => {
-    if (!selectedKeys.includes(m.key)) return false;
+    if (!selectedKeys.includes(m.key) && !fertiSelectedKeys.includes(m.key)) return false;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -2086,7 +3357,7 @@ export default function AranetUnifiedDashboard() {
   });
 
   const hiddenMetrics = allMetrics.filter(m => {
-    if (selectedKeys.includes(m.key)) return false;
+    if (selectedKeys.includes(m.key) || fertiSelectedKeys.includes(m.key)) return false;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -2098,40 +3369,68 @@ export default function AranetUnifiedDashboard() {
     return true;
   });
 
-  // Helper function to render a sensor configuration item in the sidebar
+  // Search across the merged "Non sélectionnés" listing (Aranet + built-in Priva sensors,
+  // plus the full raw Priva/Ordinateur Climatique catalog) now that the separate
+  // "Ordinateur Climatique" tab has been folded into "Sélection des données".
+  const selectionSearchQuery = privaSearch.toLowerCase().trim();
+  const hiddenMetricsFiltered = selectionSearchQuery
+    ? hiddenMetrics.filter(m => m.name.toLowerCase().includes(selectionSearchQuery))
+    : hiddenMetrics;
+  const unselectedCatalogFiltered = privaCatalog.filter(dp => {
+    if (isDatapointSelected(dp)) return false;
+    if (!selectionSearchQuery) return true;
+    return dp.name.toLowerCase().includes(selectionSearchQuery) || dp.variableId.toLowerCase().includes(selectionSearchQuery);
+  });
+
+  // Helper function to render a sensor configuration item in the sidebar. Visibility in each
+  // chart is an independent checkbox (Climat/Croissance vs Ferti Irrigation) so the same sensor
+  // can be shown in one, both, or neither - instead of the two charts each keeping their own
+  // separate sensor picker, which made it easy to end up with the same sensor duplicated or
+  // missing across the two without noticing.
   const renderSensorItem = (m: any) => {
     const isSelected = selectedKeys.includes(m.key);
+    const isFertiSelected = fertiSelectedKeys.includes(m.key);
     const config = metricConfigs[m.key] || { unit: m.units[0].id, range: "24h", axis: "left", color: m.color, smooth: false, sgWindow: 9 };
     const sensorColor = config.color || m.color;
 
     return (
       <div key={m.key} className="border-b pb-2 last:border-0 border-muted/30">
         <div className="flex items-center justify-between gap-2 py-1">
-          <button
-            onClick={() => toggleKey(m.key)}
-            className={`flex-1 flex items-center gap-2 text-left text-[11px] transition-colors ${isSelected ? "text-primary font-bold" : "text-muted-foreground"}`}
-          >
-            <span className="shrink-0">
-              {isSelected ? (
-                <CheckSquare className="h-3.5 w-3.5 text-primary" />
-              ) : (
-                <Square className="h-3.5 w-3.5 text-gray-300" />
-              )}
-            </span>
+          <div className="flex items-center gap-2.5 shrink-0">
+            <label className="flex flex-col items-center gap-0.5 cursor-pointer" title="Visible dans Climat/Croissance">
+              <input
+                type="checkbox"
+                checked={isSelected}
+                onChange={() => toggleKey(m.key)}
+                className="h-3.5 w-3.5 rounded border-gray-300 text-primary focus:ring-primary cursor-pointer"
+              />
+              <span className="text-[7px] font-black text-muted-foreground leading-none">CLIMAT</span>
+            </label>
+            <label className="flex flex-col items-center gap-0.5 cursor-pointer" title="Visible dans Ferti Irrigation">
+              <input
+                type="checkbox"
+                checked={isFertiSelected}
+                onChange={() => toggleFertiKey(m.key)}
+                className="h-3.5 w-3.5 rounded border-gray-300 text-sky-500 focus:ring-sky-500 cursor-pointer"
+              />
+              <span className="text-[7px] font-black text-muted-foreground leading-none">FERTI</span>
+            </label>
+          </div>
+
+          <div className={`flex-1 flex items-center gap-2 text-left text-[11px] transition-colors min-w-0 ${isSelected || isFertiSelected ? "text-foreground font-bold" : "text-muted-foreground"}`}>
             {isSelected ? (
               <input
                 type="text"
                 value={config.customName || ""}
                 onChange={(e) => updateMetricConfig(m.key, "customName", e.target.value)}
-                onClick={(e) => e.stopPropagation()}
                 placeholder={m.name}
                 className="text-[11px] font-bold bg-transparent border-b border-muted/30 focus:border-primary focus:outline-none w-full max-w-[280px] placeholder:text-muted-foreground/45 placeholder:font-normal text-foreground py-0.5"
               />
             ) : (
               <span className="truncate flex-1">{m.name}</span>
             )}
-          </button>
-          
+          </div>
+
           {/* Custom Color Selector */}
           <div className="relative w-3.5 h-3.5 shrink-0 rounded-full overflow-hidden border border-muted/30 cursor-pointer shadow-sm hover:scale-110 transition-transform">
             <input
@@ -2146,7 +3445,7 @@ export default function AranetUnifiedDashboard() {
           </div>
         </div>
 
-        {isSelected && (
+        {(isSelected || isFertiSelected) && (
           <div className="pl-5 mt-1 space-y-2">
             <div className="grid grid-cols-3 gap-1">
               {/* Unit Select */}
@@ -2240,7 +3539,33 @@ export default function AranetUnifiedDashboard() {
                 className="text-[9px] border rounded bg-background p-0.5 focus:outline-none focus:ring-1 focus:ring-primary h-5 cursor-pointer max-w-[130px] font-bold text-foreground"
               >
                 <option value="none">Aucun (Auto)</option>
-                <option value="radiation_sum">Somme de radiation</option>
+                <optgroup label="Climat / Croissance">
+                  <option value="co2">CO2</option>
+                  <option value="forecast">Forecas</option>
+                  <option value="gros_tuyau">Gros tuyau</option>
+                  <option value="hr_exterieure">HR extérieure</option>
+                  <option value="hr_serre">HR serre</option>
+                  <option value="pluie">Pluie</option>
+                  <option value="position_chassis_abrite">Position chassis abrité</option>
+                  <option value="position_chassis_expose">Position chassis exposé</option>
+                  <option value="radiation_instantanee">Radiation instantannée</option>
+                  <option value="radiation_sum">Somme de radiation</option>
+                  <option value="temp_exterieure">T°C extérieure</option>
+                  <option value="temp_serre">T°C serre</option>
+                  <option value="vitesse_vent">Vitesse du vent</option>
+                  <option value="vpd_haut">VPD Haut</option>
+                </optgroup>
+                <optgroup label="Physiologie">
+                  <option value="gain_cumule">Gain cumulé</option>
+                  <option value="poids_total_plante">Poids total de plante</option>
+                </optgroup>
+                <optgroup label="Ferti Irrigation">
+                  <option value="ec_pain">EC pain</option>
+                  <option value="poids_pain">Poids du pain</option>
+                  <option value="consommation_eau">Consommation d&apos;eau</option>
+                  <option value="temp_pain">T°C pain</option>
+                  <option value="humidite_pain">Humidité du pain</option>
+                </optgroup>
               </select>
             </div>
           </div>
@@ -2329,7 +3654,8 @@ export default function AranetUnifiedDashboard() {
               </button>
             </div>
 
-            {/* Box 2: Climat/Croissance (Alone in a box) */}
+            {/* Box 2: Climat/Croissance & Ferti Irrigation side by side (own sensors, own
+                selection each, but grouped together as the two "graph" tabs) */}
             <div className="flex items-center bg-muted p-0.5 rounded-xl border">
               <button
                 onClick={() => {
@@ -2345,9 +3671,33 @@ export default function AranetUnifiedDashboard() {
               >
                 Climat/Croissance
               </button>
+              <button
+                onClick={() => setActiveTab("fertigation")}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                  activeTab === "fertigation"
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Ferti Irrigation
+              </button>
             </div>
 
-            {/* Box 3: Sélection des données & Ordinateur Climatique (Together in a box) */}
+            {/* Box: Mouvements de Poids (isolated so it never crowds the main chart) */}
+            <div className="flex items-center bg-muted p-0.5 rounded-xl border">
+              <button
+                onClick={() => setActiveTab("chutes")}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                  activeTab === "chutes"
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Mouvements de Poids
+              </button>
+            </div>
+
+            {/* Box 3: Sélection des données */}
             <div className="flex items-center bg-muted p-0.5 rounded-xl border">
               <button
                 onClick={() => setActiveTab("selection")}
@@ -2359,21 +3709,16 @@ export default function AranetUnifiedDashboard() {
               >
                 Sélection des données
               </button>
-              <button
-                onClick={() => setActiveTab("climatique")}
-                className={`px-3.5 py-1 rounded-lg text-xs font-bold transition-all ${
-                  activeTab === "climatique"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Ordinateur Climatique
-              </button>
             </div>
           </div>
+        </div>
 
-          {/* Compartment Selection Dropdown */}
-          <div className="flex items-center gap-1.5 bg-muted/40 border border-muted/20 px-2 py-0.5 rounded-xl h-8">
+        <div className="flex items-center gap-3">
+          {/* Compartment selector: deliberately NOT a tab (rounded pill on a plain
+              background, not the shared "bg-muted p-0.5 rounded-xl border" tab-box
+              styling above) and pushed to the far right of the header by justify-between,
+              so it never reads as another screen/tab - it's a filter, not a destination. */}
+          <div className="flex items-center gap-1.5 bg-muted/40 border border-muted/20 px-3 py-0.5 rounded-full h-8">
             <span className="text-[9px] font-black uppercase text-muted-foreground">Compartiment :</span>
             <select
               value={selectedCompartment}
@@ -2389,15 +3734,13 @@ export default function AranetUnifiedDashboard() {
               <option value="6">Compartiment 6 (Priva)</option>
             </select>
           </div>
-        </div>
-        
-        <div className="flex items-center gap-2">
+
           {activeTab === "charts" && (
             <Button variant="ghost" size="icon" onClick={fetchActiveData} disabled={loading} className="h-8 w-8">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
             </Button>
           )}
-          {activeTab === "climatique" && (
+          {activeTab === "selection" && (
             <Button variant="ghost" size="icon" onClick={fetchPrivaData} disabled={privaLoading} className="h-8 w-8">
               <RefreshCw className={`h-3.5 w-3.5 ${privaLoading ? "animate-spin" : ""}`} />
             </Button>
@@ -2438,17 +3781,24 @@ export default function AranetUnifiedDashboard() {
                       <div className="flex items-center gap-2">
                         <input
                           type="date"
-                          value={startDate}
-                          onChange={(e) => handleStartDateChange(e.target.value)}
+                          value={startDateDraft}
+                          onChange={(e) => handleStartDateDraftChange(e.target.value)}
                           className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
                         />
                         <span className="text-xs text-muted-foreground font-bold">à</span>
                         <input
                           type="date"
-                          value={endDate}
-                          onChange={(e) => handleEndDateChange(e.target.value)}
+                          value={endDateDraft}
+                          onChange={(e) => handleEndDateDraftChange(e.target.value)}
                           className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
                         />
+                        <Button
+                          size="sm"
+                          onClick={commitDateRange}
+                          className="bg-primary hover:bg-primary/90 text-white font-black text-[10px] uppercase h-8 px-3 rounded-xl shadow-sm"
+                        >
+                          Charger
+                        </Button>
                       </div>
                       <div className="flex items-center gap-1.5 border-l pl-3 border-muted/50">
                         <span className="text-[10px] text-slate-500 uppercase font-black">Intervalle :</span>
@@ -2544,138 +3894,8 @@ export default function AranetUnifiedDashboard() {
                         )}
                       </CardHeader>
                       <CardContent className="p-4 flex-1 flex flex-col min-h-0 overflow-hidden">
-                        {/* Interactive Drop Validation Alert */}
-                        {(() => {
-                          const unvalidated = dynamicAgronomicData.filter(
-                            (d: any) => d.suddenDropVal > 0 && (!dailyEvents[d.dateStr] || dailyEvents[d.dateStr] === "none")
-                          );
-                          if (unvalidated.length === 0) return null;
-                          return (
-                            <div className="mb-4 bg-amber-500/10 border border-amber-500/20 p-3 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm shrink-0">
-                              <div className="flex items-center gap-2.5 text-xs text-amber-700 dark:text-amber-400 font-bold">
-                                <AlertTriangle className="h-4.5 w-4.5 text-amber-500 shrink-0 animate-bounce" />
-                                <div>
-                                  <span>{unvalidated.length} chute(s) brute(s) du poids de plante détectée(s) et non validée(s).</span>
-                                  <p className="text-[10px] text-muted-foreground font-semibold mt-0.5">Le gain cumulé doit être lissé pour ignorer ces incidents.</p>
-                                </div>
-                              </div>
-                              <div className="flex items-center gap-2 shrink-0">
-                                {unvalidated.map((d: any) => (
-                                  <button
-                                    key={`btn-val-${d.dateStr}`}
-                                    onClick={() => setValidatingDropDate(d.dateStr)}
-                                    className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-[10px] font-black uppercase shadow-sm transition-colors cursor-pointer"
-                                  >
-                                    Corriger {d.dateStr}
-                                  </button>
-                                ))}
-                              </div>
-                            </div>
-                          );
-                        })()}
-
-                        {/* Interactive Validation Modal (Petite fenêtre) */}
-                        {validatingDropDate && (() => {
-                          const d = dynamicAgronomicData.find((item: any) => item.dateStr === validatingDropDate);
-                          if (!d) return null;
-                          const normDate = normalizeDateKey(validatingDropDate);
-                          const currentType = dailyEventsDraft[normDate] || "none";
-                          const currentVal = dailyAdjustedWeightsDraft[normDate] !== undefined 
-                            ? dailyAdjustedWeightsDraft[normDate] 
-                            : d.suggestedCorrectionGrams;
-
-                          const handleSave = () => {
-                            setDailyEvents(prev => {
-                              const updated = { ...prev, [normDate]: currentType as any };
-                              localStorage.setItem("aranet_daily_events", JSON.stringify(updated));
-                              return updated;
-                            });
-                            setDailyEventsDraft(prev => ({
-                              ...prev,
-                              [normDate]: currentType as any
-                            }));
-                            setDailyAdjustedWeights(prev => {
-                              const updated = { ...prev, [normDate]: currentVal };
-                              localStorage.setItem("aranet_daily_adjusted_weights", JSON.stringify(updated));
-                              return updated;
-                            });
-                            setDailyAdjustedWeightsDraft(prev => ({
-                              ...prev,
-                              [normDate]: currentVal
-                            }));
-                            setValidatingDropDate(null);
-                          };
-
-                          return (
-                            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
-                              <Card className="w-full max-w-sm border shadow-2xl bg-background rounded-3xl overflow-hidden animate-in zoom-in-95 duration-200">
-                                <CardHeader className="p-5 border-b bg-muted/20">
-                                  <CardTitle className="text-xs font-black uppercase tracking-wider text-amber-600 flex items-center gap-2">
-                                    <Sliders className="h-4.5 w-4.5" /> Validation Chute Brute - {validatingDropDate}
-                                  </CardTitle>
-                                  <CardDescription className="text-[10px] font-bold">
-                                    Chute de {d.suddenDropVal} g/m² détectée à {d.suddenDropTime}.
-                                  </CardDescription>
-                                </CardHeader>
-                                <CardContent className="p-5 space-y-4">
-                                  <div className="flex flex-col gap-1.5">
-                                    <label className="text-[10px] text-muted-foreground uppercase font-black">Nature de la chute</label>
-                                    <select
-                                      value={currentType}
-                                      onChange={(e) => setDailyEventsDraft(prev => ({ ...prev, [validatingDropDate]: e.target.value as any }))}
-                                      className="w-full border rounded-xl p-2 bg-background text-xs font-bold focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer h-9"
-                                    >
-                                      <option value="none">Aucun (Laisser brute)</option>
-                                      <option value="harvest">Récolte</option>
-                                      <option value="thinning">Effeuillage</option>
-                                      <option value="descent">Descente</option>
-                                    </select>
-                                  </div>
-
-                                  <div className="flex flex-col gap-1.5">
-                                    <div className="flex items-center justify-between">
-                                      <label className="text-[10px] text-muted-foreground uppercase font-black">Delta à compenser (Lissage)</label>
-                                      <span className="text-[9px] text-emerald-600 font-bold">Suggéré : {d.suggestedCorrectionGrams} g/m²</span>
-                                    </div>
-                                    <div className="flex items-center gap-1.5 border rounded-xl px-3 bg-background h-9 shadow-sm">
-                                      <input
-                                        type="number"
-                                        value={currentVal}
-                                        onChange={(e) => setDailyAdjustedWeightsDraft(prev => ({ 
-                                          ...prev, 
-                                          [validatingDropDate]: Math.max(0, parseFloat(e.target.value) || 0) 
-                                        }))}
-                                        className="w-full bg-transparent text-left font-mono font-black text-xs focus:outline-none"
-                                      />
-                                      <span className="text-[10px] font-black text-muted-foreground uppercase shrink-0">g/m²</span>
-                                    </div>
-                                    <p className="text-[9px] text-muted-foreground mt-0.5 leading-snug">
-                                      Calculé par la moyenne des 15 points avant moins la moyenne des 15 points après la chute.
-                                    </p>
-                                  </div>
-                                </CardContent>
-                                <CardFooter className="p-5 border-t bg-muted/5 flex items-center justify-end gap-2.5">
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    onClick={() => setValidatingDropDate(null)}
-                                    className="font-bold text-xs uppercase h-9 rounded-xl"
-                                  >
-                                    Fermer
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    onClick={handleSave}
-                                    className="font-black text-xs uppercase h-9 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-sm px-4"
-                                  >
-                                    Valider et Lisser
-                                  </Button>
-                                </CardFooter>
-                              </Card>
-                            </div>
-                          );
-                        })()}
-
+                        {/* Movement banner/modal and per-movement annotations now live in the
+                            dedicated "Mouvements de Poids" tab so this comparative chart stays uncluttered. */}
                         {privaChartError && (
                           <div className={`border p-2.5 rounded-xl text-[10px] font-bold flex items-center gap-2 mb-2 shrink-0 ${
                             privaChartError.startsWith("Info")
@@ -2725,42 +3945,7 @@ export default function AranetUnifiedDashboard() {
                                     />
                                   ))}
 
-                                  {/* Weight drop annotations */}
-                                  {showAnnotations && dynamicAgronomicData.map(d => {
-                                    if (!d.suddenDropTs || d.suddenDropVal <= 0) return null;
-                                    
-                                    const eventType = dailyEvents[d.dateStr] || "none";
-                                    const compensationVal = dailyAdjustedWeights[d.dateStr] !== undefined 
-                                       ? dailyAdjustedWeights[d.dateStr] 
-                                       : d.suggestedCorrectionGrams;
-                                    const labelText = eventType === "harvest" 
-                                       ? `Récolte : -${compensationVal} g/m²` 
-                                       : eventType === "thinning" 
-                                         ? `Effeuillage : -${compensationVal} g/m²` 
-                                         : eventType === "descent"
-                                           ? `Descente : -${compensationVal} g/m²`
-                                           : `⚠️ Chute brute : -${d.suddenDropVal} g/m²`;
-                                    const strokeColor = eventType === "none" ? "#f43f5e" : "#10b981";
-
-                                    return (
-                                      <ReferenceLine
-                                        key={`drop-ann-${d.day}`}
-                                        x={d.suddenDropTs}
-                                        stroke={strokeColor}
-                                        strokeDasharray="4 4"
-                                        strokeWidth={1.5}
-                                        label={{
-                                          value: labelText,
-                                          position: "insideTopLeft",
-                                          fill: strokeColor,
-                                          fontSize: 9,
-                                          fontWeight: "bold"
-                                        }}
-                                      />
-                                    );
-                                  })}
-
-                                  <XAxis 
+                                  <XAxis
                                     dataKey="time"
                                     type="number"
                                     scale="time"
@@ -2960,6 +4145,357 @@ export default function AranetUnifiedDashboard() {
                       </CardContent>
                     </Card>
 
+                  </>
+                )}
+                </main>
+              </div>
+            ) : activeTab === "chutes" ? (
+              /* Dedicated tab for configuring/characterizing raw weight drops, isolated from
+                 the main comparative chart (which was getting crowded with banners, modals and
+                 reference lines every time a drop needed validating). This mini chart only ever
+                 shows the two series relevant to that job: cumulative gain and raw scale weight. */
+              <div className="flex-1 p-4 md:p-6 overflow-y-auto flex flex-col gap-4 min-h-0 bg-muted/10">
+                {/* Same banner layout/style as Climat/Croissance (icon+title left, date range +
+                    Charger + Intervalle right, single row, max 30 jours) - this tab plots the
+                    same chartData/timeStep as the main chart, just isolated to two series. */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-background p-4 rounded-2xl border border-muted/20 shadow-sm shrink-0">
+                  <div>
+                    <h2 className="text-sm font-black uppercase tracking-tight flex items-center gap-2">
+                      <Activity className="h-4.5 w-4.5 text-primary" /> Mouvements de Poids (Max. 30 jours)
+                    </h2>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={startDateDraft}
+                        onChange={(e) => handleStartDateDraftChange(e.target.value)}
+                        className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                      />
+                      <span className="text-xs text-muted-foreground font-bold">à</span>
+                      <input
+                        type="date"
+                        value={endDateDraft}
+                        onChange={(e) => handleEndDateDraftChange(e.target.value)}
+                        className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                      />
+                      <Button
+                        size="sm"
+                        onClick={commitDateRange}
+                        className="bg-primary hover:bg-primary/90 text-white font-black text-[10px] uppercase h-8 px-3 rounded-xl shadow-sm"
+                      >
+                        Charger
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-1.5 border-l pl-3 border-muted/50">
+                      <span className="text-[10px] text-slate-500 uppercase font-black">Intervalle :</span>
+                      <select
+                        value={timeStep}
+                        onChange={(e) => setTimeStep(e.target.value)}
+                        className="border rounded-xl px-2 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8 cursor-pointer"
+                      >
+                        <option value="auto">Auto (Dynamique)</option>
+                        <option value="1">1 minute</option>
+                        <option value="2">2 minutes</option>
+                        <option value="5">5 minutes</option>
+                        <option value="15">15 minutes</option>
+                        <option value="30">30 minutes</option>
+                        <option value="60">1 heure</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <p className="text-[10px] text-muted-foreground font-medium -mt-2">
+                  Graphique isolé (Gain Cumulé + Poids Brut Bascule). Chaque chute ou hausse brutale est détectée et lissée automatiquement ; il ne reste qu&apos;à caractériser sa nature si besoin.
+                </p>
+
+                {!selectedKeys.includes("plant_weight_gain") ? (
+                  <Card className="flex-1 flex flex-col items-center justify-center p-8 bg-background border border-muted/20 shadow-sm min-h-[300px]">
+                    <Activity className="h-8 w-8 text-muted-foreground animate-pulse mb-2" />
+                    <p className="text-xs text-muted-foreground font-bold uppercase tracking-wider text-center">Capteur &quot;Cumulative Gain&quot; non sélectionné</p>
+                    <p className="text-[10px] text-muted-foreground text-center mt-1">Allez dans l&apos;onglet &quot;Sélection des données&quot; et cochez &quot;Cumulative Gain&quot; pour suivre les mouvements de poids.</p>
+                  </Card>
+                ) : (
+                  <>
+                    <Card className="bg-background border border-muted/20 shadow-sm overflow-hidden">
+                      <CardHeader className="p-4 border-b bg-muted/5">
+                        <CardTitle className="text-xs font-black uppercase tracking-tight">Gain Cumulé & Poids Brut Bascule</CardTitle>
+                        <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Gain Cumulé (kg/m², axe gauche, corrigé automatiquement des mouvements de poids détectés) — Poids Brut Bascule (kg, axe droit, non corrigé).</p>
+                      </CardHeader>
+                      <CardContent className="p-4">
+                        <div className="w-full h-[380px] sm:h-[420px]">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+
+                              {midnightTimestamps.map((ts) => (
+                                <ReferenceLine
+                                  key={`chutes-midnight-${ts}`}
+                                  x={ts}
+                                  yAxisId="left"
+                                  stroke="#cbd5e1"
+                                  strokeDasharray="3 3"
+                                  strokeWidth={1}
+                                  label={{ value: "Minuit", position: "top", fill: "#94a3b8", fontSize: 8, fontWeight: "bold" }}
+                                />
+                              ))}
+
+                              {/* Every individual movement gets its own marker; correction is always applied,
+                                  the label is only the (auto or user-set) characterization of its nature. */}
+                              {showAnnotations && dynamicAgronomicData.flatMap(d =>
+                                (d.drops || []).map((drop: WeightDropCandidate) => {
+                                  const eventType = dailyEvents[drop.id] || drop.autoEventType;
+                                  const compensationVal = dailyAdjustedWeights[drop.id] !== undefined
+                                     ? dailyAdjustedWeights[drop.id]
+                                     : drop.suggestedCorrectionGrams;
+                                  const eventLabel = eventType === "harvest" ? "Récolte"
+                                     : eventType === "thinning" ? "Effeuillage"
+                                     : eventType === "descent" ? "Descente"
+                                     : eventType === "recalibration" ? "Recalibrage"
+                                     : eventType === "watering" ? "Arrosage/Remontée"
+                                     : "Mouvement";
+                                  const arrow = drop.direction === "drop" ? "↓" : "↑";
+                                  const sign = drop.direction === "drop" ? "+" : "-";
+                                  const labelText = `${arrow} ${eventLabel} : ${sign}${compensationVal} g/m²`;
+                                  const strokeColor = drop.direction === "drop" ? "#10b981" : "#f59e0b";
+
+                                  return (
+                                    <ReferenceLine
+                                      key={`chutes-drop-ann-${drop.id}`}
+                                      x={drop.time}
+                                      yAxisId="left"
+                                      stroke={strokeColor}
+                                      strokeDasharray="4 4"
+                                      strokeWidth={1.5}
+                                      label={{
+                                        value: labelText,
+                                        position: "insideTopLeft",
+                                        fill: strokeColor,
+                                        fontSize: 9,
+                                        fontWeight: "bold"
+                                      }}
+                                    />
+                                  );
+                                })
+                              )}
+
+                              <XAxis
+                                dataKey="time"
+                                type="number"
+                                scale="time"
+                                domain={['auto', 'auto']}
+                                tickFormatter={(ts) => {
+                                  const d = new Date(ts);
+                                  return d.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                }}
+                                tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
+                                axisLine={false}
+                                tickLine={false}
+                                dy={5}
+                              />
+                              <YAxis
+                                yAxisId="left"
+                                orientation="left"
+                                stroke="#22c55e"
+                                tick={{ fontSize: 8, fill: "#22c55e" }}
+                                width={40}
+                                label={{ value: "kg/m²", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fill: "#22c55e", fontSize: 8, fontWeight: "bold" } }}
+                              />
+                              <YAxis
+                                yAxisId="right"
+                                orientation="right"
+                                stroke="#84cc16"
+                                tick={{ fontSize: 8, fill: "#84cc16" }}
+                                width={40}
+                                label={{ value: "kg", angle: 90, position: "insideRight", style: { textAnchor: "middle", fill: "#84cc16", fontSize: 8, fontWeight: "bold" } }}
+                              />
+                              <Tooltip content={<CustomTooltip />} />
+                              <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
+
+                              <Line
+                                yAxisId="left"
+                                type="monotone"
+                                dataKey="plant_weight_gain"
+                                name="Gain Cumulé (kg/m²)"
+                                stroke="#22c55e"
+                                strokeWidth={1.6}
+                                dot={false}
+                                connectNulls={true}
+                                isAnimationActive={false}
+                              />
+                              <Line
+                                yAxisId="right"
+                                type="monotone"
+                                dataKey="rawScaleWeight"
+                                name="Poids Brut Bascule (kg)"
+                                stroke="#84cc16"
+                                strokeWidth={1}
+                                opacity={0.6}
+                                dot={false}
+                                connectNulls={true}
+                                isAnimationActive={false}
+                              />
+
+                              <Brush
+                                dataKey="time"
+                                height={35}
+                                stroke="#cbd5e1"
+                                fill="#f8fafc"
+                                tickFormatter={(timeMs) => {
+                                  if (!timeMs || isNaN(Number(timeMs))) return "";
+                                  const date = new Date(Number(timeMs));
+                                  return date.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                }}
+                              />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </CardContent>
+                    </Card>
+
+                    {/* Informative summary - every detected movement is already auto-smoothed; this only
+                        surfaces the ones whose nature hasn't been characterized by the user yet
+                        (still using the automatic best-guess label until then). */}
+                    {(() => {
+                      const uncharacterized = dynamicAgronomicData.flatMap((d: any) =>
+                        (d.drops || []).filter((drop: WeightDropCandidate) => !dailyEvents[drop.id])
+                      );
+                      if (uncharacterized.length === 0) return null;
+                      return (
+                        <div className="bg-sky-500/10 border border-sky-500/20 p-3 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm shrink-0">
+                          <div className="flex items-center gap-2.5 text-xs text-sky-700 dark:text-sky-400 font-bold">
+                            <Activity className="h-4.5 w-4.5 text-sky-500 shrink-0" />
+                            <div>
+                              <span>{uncharacterized.length} mouvement(s) de poids détecté(s) et déjà lissé(s) automatiquement.</span>
+                              <p className="text-[10px] text-muted-foreground font-semibold mt-0.5">Nature devinée automatiquement ; ajuste-la si tu connais la vraie cause.</p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            {uncharacterized.map((drop: WeightDropCandidate) => (
+                              <button
+                                key={`btn-val-${drop.id}`}
+                                onClick={() => setValidatingDropId(drop.id)}
+                                className="px-2.5 py-1 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-[10px] font-black uppercase shadow-sm transition-colors cursor-pointer"
+                              >
+                                Caractériser {drop.dateStr} {drop.timeStr}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {/* Interactive Validation Modal (Petite fenêtre) */}
+                    {validatingDropId && (() => {
+                      const { dateStr: dropDateStr } = parseDropId(validatingDropId);
+                      const day = dynamicAgronomicData.find((item: any) => item.dateStr === dropDateStr);
+                      const drop = day?.drops?.find((dd: WeightDropCandidate) => dd.id === validatingDropId);
+                      if (!drop) return null;
+                      const currentType = dailyEventsDraft[validatingDropId] || drop.autoEventType;
+                      const currentVal = dailyAdjustedWeightsDraft[validatingDropId] !== undefined
+                        ? dailyAdjustedWeightsDraft[validatingDropId]
+                        : drop.suggestedCorrectionGrams;
+
+                      const handleSave = () => {
+                        setDailyEvents(prev => {
+                          const updated = { ...prev, [validatingDropId]: currentType as any };
+                          localStorage.setItem("aranet_daily_events", JSON.stringify(updated));
+                          return updated;
+                        });
+                        setDailyEventsDraft(prev => ({
+                          ...prev,
+                          [validatingDropId]: currentType as any
+                        }));
+                        setDailyAdjustedWeights(prev => {
+                          const updated = { ...prev, [validatingDropId]: currentVal };
+                          localStorage.setItem("aranet_daily_adjusted_weights", JSON.stringify(updated));
+                          return updated;
+                        });
+                        setDailyAdjustedWeightsDraft(prev => ({
+                          ...prev,
+                          [validatingDropId]: currentVal
+                        }));
+                        setValidatingDropId(null);
+                      };
+
+                      return (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+                          <Card className="w-full max-w-sm border shadow-2xl bg-background rounded-3xl overflow-hidden animate-in zoom-in-95 duration-200">
+                            <CardHeader className="p-5 border-b bg-muted/20">
+                              <CardTitle className="text-xs font-black uppercase tracking-wider text-sky-600 flex items-center gap-2">
+                                <Sliders className="h-4.5 w-4.5" /> Mouvement de Poids - {drop.dateStr}
+                              </CardTitle>
+                              <CardDescription className="text-[10px] font-bold">
+                                {drop.direction === "drop" ? "Chute" : "Hausse"} de {drop.suddenDropVal} g/m² détectée à {drop.timeStr} - déjà lissée automatiquement.
+                              </CardDescription>
+                            </CardHeader>
+                            <CardContent className="p-5 space-y-4">
+                              <div className="flex flex-col gap-1.5">
+                                <label className="text-[10px] text-muted-foreground uppercase font-black">Nature du mouvement</label>
+                                <select
+                                  value={currentType}
+                                  onChange={(e) => setDailyEventsDraft(prev => ({ ...prev, [validatingDropId]: e.target.value as any }))}
+                                  className="w-full border rounded-xl p-2 bg-background text-xs font-bold focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer h-9"
+                                >
+                                  {drop.direction === "drop" ? (
+                                    <>
+                                      <option value="harvest">Récolte</option>
+                                      <option value="thinning">Effeuillage</option>
+                                      <option value="descent">Descente</option>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <option value="recalibration">Recalibrage bascule</option>
+                                      <option value="watering">Arrosage/Remontée</option>
+                                    </>
+                                  )}
+                                </select>
+                              </div>
+
+                              <div className="flex flex-col gap-1.5">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-[10px] text-muted-foreground uppercase font-black">Delta compensé (Lissage)</label>
+                                  <span className="text-[9px] text-emerald-600 font-bold">Suggéré : {drop.suggestedCorrectionGrams} g/m²</span>
+                                </div>
+                                <div className="flex items-center gap-1.5 border rounded-xl px-3 bg-background h-9 shadow-sm">
+                                  <input
+                                    type="number"
+                                    value={currentVal}
+                                    onChange={(e) => setDailyAdjustedWeightsDraft(prev => ({
+                                      ...prev,
+                                      [validatingDropId]: Math.max(0, parseFloat(e.target.value) || 0)
+                                    }))}
+                                    className="w-full bg-transparent text-left font-mono font-black text-xs focus:outline-none"
+                                  />
+                                  <span className="text-[10px] font-black text-muted-foreground uppercase shrink-0">g/m²</span>
+                                </div>
+                                <p className="text-[9px] text-muted-foreground mt-0.5 leading-snug">
+                                  Calculé par la moyenne des 15 points avant moins la moyenne des 15 points après le mouvement. Déjà appliqué automatiquement ; modifie-le seulement si tu veux affiner le lissage.
+                                </p>
+                              </div>
+                            </CardContent>
+                            <CardFooter className="p-5 border-t bg-muted/5 flex items-center justify-end gap-2.5">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setValidatingDropId(null)}
+                                className="font-bold text-xs uppercase h-9 rounded-xl"
+                              >
+                                Fermer
+                              </Button>
+                              <Button
+                                size="sm"
+                                onClick={handleSave}
+                                className="font-black text-xs uppercase h-9 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-sm px-4"
+                              >
+                                Enregistrer
+                              </Button>
+                            </CardFooter>
+                          </Card>
+                        </div>
+                      );
+                    })()}
+
                     {/* Annotations & Events Settings Panel */}
                     <div className="bg-background border border-border/80 p-4 rounded-2xl space-y-3 shadow-sm">
                       <div className="flex items-center justify-between">
@@ -2972,14 +4508,14 @@ export default function AranetUnifiedDashboard() {
                             className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary cursor-pointer"
                           />
                           <label htmlFor="toggle-annotations" className="text-xs font-black uppercase text-foreground cursor-pointer select-none">
-                            Afficher les repères d&apos;événements de chute de poids sur le graphique
+                            Afficher les repères de mouvements de poids sur le graphique
                           </label>
                         </div>
                       </div>
 
                       <div className="border-t pt-3 space-y-3 bg-muted/5 p-3 rounded-xl border border-muted/20">
                         <h4 className="text-[10px] font-black uppercase text-slate-600 tracking-wider flex items-center gap-1.5">
-                          <Activity className="h-3.5 w-3.5" /> Déclarer manuellement une chute brute
+                          <Activity className="h-3.5 w-3.5" /> Déclarer manuellement un mouvement de poids
                         </h4>
                         <div className="flex flex-wrap items-end gap-3">
                           <div className="flex flex-col gap-1">
@@ -3006,6 +4542,17 @@ export default function AranetUnifiedDashboard() {
                             />
                           </div>
                           <div className="flex flex-col gap-1">
+                            <span className="text-[9px] font-bold text-muted-foreground uppercase">Direction</span>
+                            <select
+                              value={newManualDropDirection}
+                              onChange={(e) => setNewManualDropDirection(e.target.value as "drop" | "rise")}
+                              className="bg-background border rounded-lg px-2.5 py-1 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-primary h-8 cursor-pointer"
+                            >
+                              <option value="drop">Chute</option>
+                              <option value="rise">Hausse</option>
+                            </select>
+                          </div>
+                          <div className="flex flex-col gap-1">
                             <span className="text-[9px] font-bold text-muted-foreground uppercase">Taille (g/m²)</span>
                             <input
                               type="number"
@@ -3027,11 +4574,11 @@ export default function AranetUnifiedDashboard() {
                       </div>
 
                       {showAnnotations && (() => {
-                        const drops = dynamicAgronomicData.filter(d => d.suddenDropVal > 0);
+                        const drops: WeightDropCandidate[] = dynamicAgronomicData.flatMap(d => d.drops || []);
                         if (drops.length === 0) {
                           return (
                             <div className="text-[10px] text-muted-foreground font-semibold border-t pt-2">
-                              Aucune baisse de poids brutale de biomasse n&apos;a été détectée.
+                              Aucun mouvement de poids brutal de biomasse n&apos;a été détecté.
                             </div>
                           );
                         }
@@ -3039,32 +4586,41 @@ export default function AranetUnifiedDashboard() {
                         return (
                           <div className="border-t pt-3 space-y-2.5">
                             <h4 className="text-[10px] font-black uppercase text-muted-foreground tracking-wider">
-                              Chutes de Poids Détectées et Ajustements de Lissage :
+                              Mouvements de Poids Détectés et Lissés Automatiquement ({drops.length}) :
                             </h4>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                               {drops.map(d => {
-                                const eventVal = dailyEventsDraft[d.dateStr] || "none";
-                                const adjVal = dailyAdjustedWeightsDraft[d.dateStr] !== undefined 
-                                  ? dailyAdjustedWeightsDraft[d.dateStr] 
+                                const eventVal = dailyEventsDraft[d.id] || d.autoEventType;
+                                const adjVal = dailyAdjustedWeightsDraft[d.id] !== undefined
+                                  ? dailyAdjustedWeightsDraft[d.id]
                                   : d.suggestedCorrectionGrams;
-                                
+                                const arrow = d.direction === "drop" ? "↓" : "↑";
+
                                 return (
-                                  <div key={d.day} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-muted/20 border border-border/50">
+                                  <div key={d.id} className="flex items-center justify-between gap-3 p-3 rounded-xl bg-muted/20 border border-border/50">
                                     <div className="flex flex-col gap-0.5">
-                                      <span className="text-[10px] font-black text-foreground">{d.dateStr} à {d.suddenDropTime}</span>
-                                      <span className="text-[9px] text-muted-foreground font-semibold">Brute : -{d.suddenDropVal} g/m² (Delta suggéré : {d.suggestedCorrectionGrams} g/m²)</span>
+                                      <span className="text-[10px] font-black text-foreground">{arrow} {d.dateStr} à {d.timeStr}</span>
+                                      <span className="text-[9px] text-muted-foreground font-semibold">Brut : {d.suddenDropVal} g/m² (Delta lissé : {d.suggestedCorrectionGrams} g/m²)</span>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                      {/* Dropdown Nature */}
+                                      {/* Dropdown Nature - auto-caractérisé, modifiable */}
                                       <select
                                         value={eventVal}
-                                        onChange={(e) => setDailyEventsDraft(prev => ({ ...prev, [d.dateStr]: e.target.value as any }))}
+                                        onChange={(e) => setDailyEventsDraft(prev => ({ ...prev, [d.id]: e.target.value as any }))}
                                         className="bg-background border rounded-lg px-2 py-1 text-[10px] font-black uppercase text-foreground focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer"
                                       >
-                                        <option value="none">Aucun</option>
-                                        <option value="harvest">Récolte</option>
-                                        <option value="thinning">Effeuillage</option>
-                                        <option value="descent">Descente</option>
+                                        {d.direction === "drop" ? (
+                                          <>
+                                            <option value="harvest">Récolte</option>
+                                            <option value="thinning">Effeuillage</option>
+                                            <option value="descent">Descente</option>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <option value="recalibration">Recalibrage</option>
+                                            <option value="watering">Arrosage/Remontée</option>
+                                          </>
+                                        )}
                                       </select>
 
                                       {/* Adjusted Loss Input */}
@@ -3072,42 +4628,42 @@ export default function AranetUnifiedDashboard() {
                                         <input
                                           type="number"
                                           value={adjVal}
-                                          onChange={(e) => setDailyAdjustedWeightsDraft(prev => ({ 
-                                            ...prev, 
-                                            [d.dateStr]: Math.max(0, parseFloat(e.target.value) || 0) 
+                                          onChange={(e) => setDailyAdjustedWeightsDraft(prev => ({
+                                            ...prev,
+                                            [d.id]: Math.max(0, parseFloat(e.target.value) || 0)
                                           }))}
                                           className="w-12 bg-transparent text-center font-mono font-bold text-[10px] focus:outline-none"
                                         />
                                         <span className="text-[9px] font-bold text-muted-foreground uppercase">g/m²</span>
                                       </div>
 
-                                      {manualDrops[d.dateStr] && (
+                                      {manualDrops[d.id] && (
                                         <button
                                           onClick={() => {
                                             setManualDrops(prev => {
                                               const copy = { ...prev };
-                                              delete copy[d.dateStr];
+                                              delete copy[d.id];
                                               localStorage.setItem("aranet_manual_drops", JSON.stringify(copy));
                                               return copy;
                                             });
                                             setDailyEventsDraft(prev => {
                                               const copy = { ...prev };
-                                              delete copy[d.dateStr];
+                                              delete copy[d.id];
                                               return copy;
                                             });
                                             setDailyAdjustedWeightsDraft(prev => {
                                               const copy = { ...prev };
-                                              delete copy[d.dateStr];
+                                              delete copy[d.id];
                                               return copy;
                                             });
                                             setDailyEvents(prev => {
                                               const copy = { ...prev };
-                                              delete copy[d.dateStr];
+                                              delete copy[d.id];
                                               return copy;
                                             });
                                             setDailyAdjustedWeights(prev => {
                                               const copy = { ...prev };
-                                              delete copy[d.dateStr];
+                                              delete copy[d.id];
                                               return copy;
                                             });
                                           }}
@@ -3135,8 +4691,8 @@ export default function AranetUnifiedDashboard() {
                                 disabled={!hasUnsavedChanges}
                                 onClick={handleSaveAdjustments}
                                 className={`font-black text-xs uppercase px-4 py-1.5 rounded-xl transition-all shadow-sm ${
-                                  hasUnsavedChanges 
-                                    ? "bg-emerald-600 hover:bg-emerald-700 text-white" 
+                                  hasUnsavedChanges
+                                    ? "bg-emerald-600 hover:bg-emerald-700 text-white"
                                     : "bg-slate-100 dark:bg-slate-800 text-muted-foreground border cursor-not-allowed"
                                 }`}
                               >
@@ -3149,7 +4705,324 @@ export default function AranetUnifiedDashboard() {
                     </div>
                   </>
                 )}
-                </main>
+              </div>
+            ) : activeTab === "fertigation" ? (
+              /* Ferti Irrigation tab - own sensor selection (slab EC/WC + slab weight) and own
+                 date range, deliberately kept out of the main Climat/Croissance chart/selection. */
+              <div className="flex-1 p-4 md:p-6 overflow-y-auto flex flex-col gap-4 min-h-0 bg-muted/10">
+                {/* Same banner layout/style as Climat/Croissance and Mouvements de Poids -
+                    icon+title left, date range + Charger + Intervalle right, single row. */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-background p-4 rounded-2xl border border-muted/20 shadow-sm shrink-0">
+                  <div>
+                    <h2 className="text-sm font-black uppercase tracking-tight flex items-center gap-2">
+                      <Droplets className="h-4.5 w-4.5 text-primary" /> Ferti Irrigation (Max. 30 jours)
+                      {fertiLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary ml-1" />}
+                    </h2>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={fertiStartDateDraft}
+                        onChange={(e) => handleFertiStartDateDraftChange(e.target.value)}
+                        className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                      />
+                      <span className="text-xs text-muted-foreground font-bold">à</span>
+                      <input
+                        type="date"
+                        value={fertiEndDateDraft}
+                        onChange={(e) => handleFertiEndDateDraftChange(e.target.value)}
+                        className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                      />
+                      <Button
+                        size="sm"
+                        onClick={commitFertiDateRange}
+                        className="bg-primary hover:bg-primary/90 text-white font-black text-[10px] uppercase h-8 px-3 rounded-xl shadow-sm"
+                      >
+                        Charger
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-1.5 border-l pl-3 border-muted/50">
+                      <span className="text-[10px] text-slate-500 uppercase font-black">Intervalle :</span>
+                      <select
+                        value={fertiTimeStep}
+                        onChange={(e) => setFertiTimeStep(e.target.value)}
+                        className="border rounded-xl px-2 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8 cursor-pointer"
+                      >
+                        <option value="auto">Auto (Dynamique)</option>
+                        <option value="1">1 minute</option>
+                        <option value="2">2 minutes</option>
+                        <option value="5">5 minutes</option>
+                        <option value="15">15 minutes</option>
+                        <option value="30">30 minutes</option>
+                        <option value="60">1 heure</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <p className="text-[10px] text-muted-foreground font-medium -mt-2">
+                  Capteurs gérés depuis l&apos;onglet &quot;Sélection des données&quot; (case FERTI de chaque capteur).
+                </p>
+
+                {fertiError && (
+                  <div className="bg-amber-500/10 border border-amber-500/25 text-amber-700 p-2.5 rounded-xl text-[10px] font-bold flex items-center gap-2 shrink-0">
+                    <AlertTriangle className="h-3.5 w-3.5 text-amber-500 shrink-0" /> <span>{fertiError}</span>
+                  </div>
+                )}
+                {fertiPrivaError && (
+                  <div className={`border p-2.5 rounded-xl text-[10px] font-bold flex items-center gap-2 shrink-0 ${
+                    fertiPrivaError.startsWith("Info")
+                      ? "bg-blue-500/10 border-blue-500/25 text-blue-700"
+                      : "bg-amber-500/10 border-amber-500/25 text-amber-700"
+                  }`}>
+                    {fertiPrivaError.startsWith("Info") ? (
+                      <Info className="h-3.5 w-3.5 text-blue-500 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+                    )}
+                    <span>{fertiPrivaError}</span>
+                  </div>
+                )}
+
+                {/* Sensors marked FERTI in "Sélection des données" - editing which sensors are
+                    active happens there (a sensor's Climat/Croissance and Ferti Irrigation
+                    visibility are always set from the same single place, never duplicated), but
+                    showing/hiding an active sensor on THIS chart is a display concern local to
+                    this tab, same "loaded but hidden by default" pattern as Climat/Croissance. */}
+                <div className="flex flex-wrap items-center gap-2 bg-background p-3 rounded-2xl border border-muted/20 shadow-sm shrink-0">
+                  <span className="text-[10px] font-black text-muted-foreground uppercase mr-1">Afficher / Masquer :</span>
+                  {fertiSelectedKeys.length === 0 ? (
+                    <span className="text-[10px] text-muted-foreground italic">Aucun - cochez FERTI sur un capteur dans &quot;Sélection des données&quot;.</span>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-1.5 mr-2 shrink-0">
+                        <button
+                          onClick={() => setHiddenFertiKeysOnChart([])}
+                          className="px-2 py-0.5 rounded-md text-[9px] font-black uppercase bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 transition-colors"
+                        >
+                          Tout afficher
+                        </button>
+                        <button
+                          onClick={() => setHiddenFertiKeysOnChart(fertiSelectedKeys)}
+                          className="px-2 py-0.5 rounded-md text-[9px] font-black uppercase bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 transition-colors"
+                        >
+                          Tout masquer
+                        </button>
+                      </div>
+                      {fertiSelectedKeys.map(key => {
+                        const m = allMetrics.find(item => item.key === key);
+                        if (!m) return null;
+                        const isVisible = !hiddenFertiKeysOnChart.includes(key);
+                        const config = metricConfigs[key] || {};
+                        const sensorColor = config.color || m.color;
+                        return (
+                          <button
+                            key={`ferti-toggle-${key}`}
+                            onClick={() => {
+                              if (isVisible) {
+                                setHiddenFertiKeysOnChart([...hiddenFertiKeysOnChart, key]);
+                              } else {
+                                setHiddenFertiKeysOnChart(hiddenFertiKeysOnChart.filter(k => k !== key));
+                              }
+                            }}
+                            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-bold border transition-all ${
+                              isVisible
+                                ? "text-white shadow-sm"
+                                : "bg-muted/10 text-muted-foreground border-muted-foreground/15 opacity-60 hover:opacity-85"
+                            }`}
+                            style={{
+                              backgroundColor: isVisible ? sensorColor : undefined,
+                              borderColor: isVisible ? sensorColor : undefined
+                            }}
+                          >
+                            <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                            {config.customName || m.name}
+                          </button>
+                        );
+                      })}
+                    </>
+                  )}
+                </div>
+
+                {fertiSelectedKeys.length === 0 ? (
+                  <Card className="flex-1 flex flex-col items-center justify-center p-8 bg-background border border-muted/20 shadow-sm min-h-[300px]">
+                    <Droplets className="h-8 w-8 text-muted-foreground animate-pulse mb-2" />
+                    <p className="text-xs text-muted-foreground font-bold uppercase tracking-wider text-center">Aucun capteur sélectionné</p>
+                  </Card>
+                ) : fertiChartData.length === 0 ? (
+                  <Card className="flex-1 flex items-center justify-center p-8 bg-background border border-muted/20 shadow-sm min-h-[300px] text-xs text-muted-foreground">
+                    En attente de relevés pour cette période...
+                  </Card>
+                ) : (
+                  <Card className="bg-background border border-muted/20 shadow-sm overflow-hidden">
+                    <CardHeader className="p-4 border-b bg-muted/5 flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div>
+                        <CardTitle className="text-xs font-black uppercase tracking-tight">Substrat & Bascule</CardTitle>
+                        <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Axes regroupés par unité et par côté (gauche/droite), configurables par capteur dans &quot;Sélection des données&quot; — même système que Climat/Croissance.</p>
+                      </div>
+                      {/* Same Y-axis override system as Climat/Croissance, scoped to this chart */}
+                      <div className="grid grid-cols-2 gap-2 shrink-0">
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9px] font-bold text-primary">G</span>
+                          <input type="number" placeholder="Min" value={yLeftMinFerti} onChange={(e) => setYLeftMinFerti(e.target.value)} className="w-14 text-[10px] border rounded-lg bg-background p-1 focus:outline-none focus:ring-1 focus:ring-primary text-center h-7 font-semibold" />
+                          <input type="number" placeholder="Max" value={yLeftMaxFerti} onChange={(e) => setYLeftMaxFerti(e.target.value)} className="w-14 text-[10px] border rounded-lg bg-background p-1 focus:outline-none focus:ring-1 focus:ring-primary text-center h-7 font-semibold" />
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9px] font-bold text-green-600">D</span>
+                          <input type="number" placeholder="Min" value={yRightMinFerti} onChange={(e) => setYRightMinFerti(e.target.value)} className="w-14 text-[10px] border rounded-lg bg-background p-1 focus:outline-none focus:ring-1 focus:ring-primary text-center h-7 font-semibold" />
+                          <input type="number" placeholder="Max" value={yRightMaxFerti} onChange={(e) => setYRightMaxFerti(e.target.value)} className="w-14 text-[10px] border rounded-lg bg-background p-1 focus:outline-none focus:ring-1 focus:ring-primary text-center h-7 font-semibold" />
+                        </div>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="p-4">
+                      <div className="w-full h-[420px] sm:h-[460px]">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={fertiChartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+                            <XAxis
+                              dataKey="time"
+                              type="number"
+                              scale="time"
+                              domain={['auto', 'auto']}
+                              tickFormatter={(ts) => {
+                                const d = new Date(ts);
+                                return d.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                              }}
+                              tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
+                              axisLine={false}
+                              tickLine={false}
+                              dy={5}
+                            />
+
+                            {/* Dynamic grouped Y-axes by unit & side, same system as Climat/Croissance */}
+                            {fertiActiveYAxes.map((yAxis) => {
+                              const isShared = yAxis.keys.length > 1;
+                              const axisColor = isShared ? "#64748b" : yAxis.color;
+
+                              const parsedLeftMin = Number(yLeftMinFerti);
+                              const parsedLeftMax = Number(yLeftMaxFerti);
+                              const parsedRightMin = Number(yRightMinFerti);
+                              const parsedRightMax = Number(yRightMaxFerti);
+                              const domainMin = yAxis.axis === "left"
+                                ? (yLeftMinFerti !== "" && !isNaN(parsedLeftMin) ? parsedLeftMin : "auto")
+                                : (yRightMinFerti !== "" && !isNaN(parsedRightMin) ? parsedRightMin : "auto");
+                              const domainMax = yAxis.axis === "left"
+                                ? (yLeftMaxFerti !== "" && !isNaN(parsedLeftMax) ? parsedLeftMax : "auto")
+                                : (yRightMaxFerti !== "" && !isNaN(parsedRightMax) ? parsedRightMax : "auto");
+
+                              return (
+                                <YAxis
+                                  key={`ferti-yAxis-${yAxis.axisId}`}
+                                  yAxisId={yAxis.axisId}
+                                  orientation={yAxis.axis}
+                                  stroke={axisColor}
+                                  tick={{ fontSize: 8, fill: axisColor }}
+                                  domain={[domainMin, domainMax]}
+                                  width={36}
+                                  label={{
+                                    value: yAxis.unitName,
+                                    angle: yAxis.axis === "left" ? -90 : 90,
+                                    position: yAxis.axis === "left" ? "insideLeft" : "insideRight",
+                                    style: { textAnchor: "middle", fill: axisColor, fontSize: 8, fontWeight: "bold" }
+                                  }}
+                                />
+                              );
+                            })}
+
+                            <Tooltip content={<CustomTooltip />} />
+                            <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
+                            {visibleFertiChartKeys.flatMap(key => {
+                              const m = allMetrics.find((item: any) => item.key === key);
+                              if (!m) return [];
+                              const config = metricConfigs[key] || {};
+                              const unitObj = m.units.find((u: any) => u.id === config.unit) || m.units[0];
+                              const unitName = normalizeUnitName(unitObj ? unitObj.name : "");
+                              const sensorColor = config.color || m.color;
+                              const isSmooth = config.smooth === true || config.smooth === "true";
+
+                              const lines = [
+                                <Line
+                                  key={`${key}-smoothed`}
+                                  yAxisId={`${config.axis || "left"}-${unitName}`}
+                                  type="monotone"
+                                  dataKey={key}
+                                  name={`${config.customName || m.name} (${unitName})`}
+                                  stroke={sensorColor}
+                                  strokeWidth={1.4}
+                                  dot={false}
+                                  connectNulls={true}
+                                  isAnimationActive={false}
+                                />
+                              ];
+
+                              if (isSmooth) {
+                                lines.unshift(
+                                  <Line
+                                    key={`${key}-raw`}
+                                    yAxisId={`${config.axis || "left"}-${unitName}`}
+                                    type="monotone"
+                                    dataKey={`${key}_raw`}
+                                    name={`${config.customName || m.name} (Brut)`}
+                                    stroke={sensorColor}
+                                    strokeWidth={0.8}
+                                    opacity={0.25}
+                                    dot={false}
+                                    connectNulls={true}
+                                    legendType="none"
+                                    isAnimationActive={false}
+                                  />
+                                );
+                              }
+
+                              return lines;
+                            })}
+                            <Brush
+                              dataKey="time"
+                              height={35}
+                              stroke="#cbd5e1"
+                              fill="#f8fafc"
+                              tickFormatter={(timeMs) => {
+                                if (!timeMs || isNaN(Number(timeMs))) return "";
+                                const date = new Date(Number(timeMs));
+                                return date.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                              }}
+                            />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+
+                      {/* Colored bottom indicator badges, same system as Climat/Croissance */}
+                      <div className="flex items-center justify-between border-t pt-2 mt-2 px-1 text-[10px] font-bold">
+                        <div className="flex flex-wrap gap-1.5">
+                          {fertiLeftActiveKeys.map(key => {
+                            const m = allMetrics.find(item => item.key === key);
+                            if (!m) return null;
+                            const config = metricConfigs[key] || {};
+                            const sensorColor = config.color || m.color;
+                            return (
+                              <div key={`ferti-badge-${key}`} className="px-1.5 py-0.5 border rounded shadow-sm text-[9px]" style={{ borderColor: sensorColor, color: sensorColor, backgroundColor: `${sensorColor}05` }}>
+                                {config.customName || m.name}
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {fertiRightActiveKeys.map(key => {
+                            const m = allMetrics.find(item => item.key === key);
+                            if (!m) return null;
+                            const config = metricConfigs[key] || {};
+                            const sensorColor = config.color || m.color;
+                            return (
+                              <div key={`ferti-badge-${key}`} className="px-1.5 py-0.5 border rounded shadow-sm text-[9px]" style={{ borderColor: sensorColor, color: sensorColor, backgroundColor: `${sensorColor}05` }}>
+                                {config.customName || m.name}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
               </div>
             ) : activeTab === "selection" ? (
               /* Data Selection Tab Content (Beautiful Form Layout) */
@@ -3160,7 +5033,7 @@ export default function AranetUnifiedDashboard() {
                       <Sliders className="h-5 w-5 text-primary animate-pulse" /> Configuration & Sélection des Capteurs
                     </CardTitle>
                     <CardDescription className="text-xs">
-                      Cochez les capteurs que vous souhaitez tracer sur le graphique et ajustez leurs options d&apos;axes et de lissage.
+                      Pour chaque capteur, cochez CLIMAT et/ou FERTI selon le(s) graphique(s) où il doit apparaître (aucun capteur redondant entre les deux), et ajustez ses options d&apos;axes et de lissage.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="p-6 space-y-8">
@@ -3181,8 +5054,8 @@ export default function AranetUnifiedDashboard() {
                             <input
                               type="number"
                               min="1"
-                              value={plantsOnScale}
-                              onChange={(e) => setPlantsOnScale(Math.max(1, Number(e.target.value) || 1))}
+                              value={plantsOnScaleDraft}
+                              onChange={(e) => handlePlantsOnScaleDraftChange(e.target.value)}
                               className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary text-center font-bold"
                             />
                           </div>
@@ -3192,8 +5065,8 @@ export default function AranetUnifiedDashboard() {
                               type="number"
                               step="0.1"
                               min="0.1"
-                              value={densityPerM2}
-                              onChange={(e) => setDensityPerM2(Math.max(0.1, Number(e.target.value) || 0.1))}
+                              value={densityPerM2Draft}
+                              onChange={(e) => handleDensityPerM2DraftChange(e.target.value)}
                               className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary text-center font-bold"
                             />
                           </div>
@@ -3287,10 +5160,10 @@ export default function AranetUnifiedDashboard() {
                       <Card className="border border-muted-foreground/15 shadow-sm rounded-2xl overflow-hidden">
                         <CardHeader className="p-4 pb-2 border-b bg-muted/5">
                           <CardTitle className="text-xs font-black uppercase tracking-tight text-primary flex items-center justify-between">
-                            <span>Capteurs Actuellement Sélectionnés ({visibleMetrics.length})</span>
+                            <span>Sélectionnés (Climat et/ou Ferti) ({visibleMetrics.length})</span>
                             {visibleMetrics.length > 0 && (
-                              <button 
-                                onClick={() => setSelectedKeys([])} 
+                              <button
+                                onClick={() => { setSelectedKeys([]); setFertiSelectedKeys([]); }}
                                 className="text-[10px] text-muted-foreground hover:text-primary font-bold transition-colors cursor-pointer"
                               >
                                 Tout effacer
@@ -3301,7 +5174,7 @@ export default function AranetUnifiedDashboard() {
                         <CardContent className="p-4 max-h-[500px] overflow-y-auto space-y-1">
                           {visibleMetrics.length === 0 ? (
                             <div className="text-center py-8 text-xs text-muted-foreground font-semibold">
-                              Aucun capteur activé. Cochez des capteurs dans la liste de droite.
+                              Aucun capteur activé. Cochez CLIMAT et/ou FERTI sur un capteur dans la liste de droite.
                             </div>
                           ) : (
                             renderGroupedMetrics(visibleMetrics)
@@ -3309,20 +5182,52 @@ export default function AranetUnifiedDashboard() {
                         </CardContent>
                       </Card>
 
-                      {/* Right: Hidden metrics */}
+                      {/* Right: Hidden metrics (Aranet + Ordinateur Climatique non sélectionnés) */}
                       <Card className="border border-muted-foreground/15 shadow-sm rounded-2xl overflow-hidden">
-                        <CardHeader className="p-4 pb-2 border-b bg-muted/5">
-                          <CardTitle className="text-xs font-black uppercase tracking-tight text-muted-foreground">
-                            Autres Capteurs Disponibles ({hiddenMetrics.length})
+                        <CardHeader className="p-4 pb-2 border-b bg-muted/5 space-y-2">
+                          <CardTitle className="text-xs font-black uppercase tracking-tight text-muted-foreground flex items-center justify-between">
+                            <span>Non sélectionnés ({hiddenMetrics.length + unselectedCatalogFiltered.length})</span>
+                            {privaLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary" />}
                           </CardTitle>
+                          <input
+                            type="text"
+                            placeholder="Rechercher un capteur (Aranet ou Ordinateur Climatique)..."
+                            value={privaSearch}
+                            onChange={(e) => setPrivaSearch(e.target.value)}
+                            className="w-full border rounded-xl px-3 py-1.5 text-xs bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8 font-bold"
+                          />
                         </CardHeader>
                         <CardContent className="p-4 max-h-[500px] overflow-y-auto space-y-1">
-                          {hiddenMetrics.length === 0 ? (
+                          {hiddenMetricsFiltered.length === 0 && unselectedCatalogFiltered.length === 0 ? (
                             <div className="text-center py-8 text-xs text-emerald-500 font-bold">
-                              Tous les capteurs sont actuellement actifs sur le graphique !
+                              {privaSearch.trim() ? "Aucun capteur ne correspond à votre recherche." : "Tous les capteurs sont actuellement actifs sur le graphique !"}
                             </div>
                           ) : (
-                            renderGroupedMetrics(hiddenMetrics)
+                            <>
+                              {renderGroupedMetrics(hiddenMetricsFiltered)}
+                              {unselectedCatalogFiltered.length > 0 && (
+                                <div className="space-y-2 mt-3 border border-muted/20 p-3 rounded-2xl bg-muted/5">
+                                  <h4 className="text-[10px] font-black uppercase text-primary tracking-wider border-b pb-1 flex items-center justify-between">
+                                    <span>Ordinateur Climatique - Catalogue</span>
+                                    <span className="text-[8px] bg-primary/10 text-primary px-1.5 py-0.5 rounded-full">{unselectedCatalogFiltered.length}</span>
+                                  </h4>
+                                  <div className="space-y-1 pl-0.5 pt-1">
+                                    {unselectedCatalogFiltered.map((dp, idx) => (
+                                      <button
+                                        key={`${dp.variableId}-${idx}`}
+                                        onClick={() => toggleCatalogDatapoint(dp)}
+                                        className="w-full flex items-center gap-2 text-left text-[11px] py-1 border-b last:border-0 border-muted/30 text-muted-foreground hover:text-foreground transition-colors"
+                                        title="Sélectionner pour le graphique"
+                                      >
+                                        <Square className="h-3.5 w-3.5 text-gray-300 dark:text-gray-600 shrink-0" />
+                                        <span className="truncate flex-1">{dp.name}</span>
+                                        <span className="text-[9px] text-muted-foreground/70 shrink-0">{dp.unit || ""}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </>
                           )}
                         </CardContent>
                       </Card>
@@ -3331,263 +5236,48 @@ export default function AranetUnifiedDashboard() {
                   </CardContent>
                 </Card>
               </div>
-            ) : activeTab === "climatique" ? (
-              /* Climate Computer Tab Content */
-              <div className="flex-1 overflow-y-auto bg-muted/10 p-6 md:p-10 max-h-[calc(100vh-3.5rem)] space-y-6">
-                
-                {/* Header title */}
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-background p-6 rounded-3xl border border-muted/20 shadow-md">
-                  <div>
-                    <h2 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-foreground">
-                      <Cpu className="h-5 w-5 text-primary animate-pulse" /> Ordinateur Climatique Priva
-                    </h2>
-                    <p className="text-[10px] text-muted-foreground mt-1 font-bold">
-                      Données en direct de la station météo et des compartiments de <span className="font-bold text-foreground">La Landelle aux Menards</span> (SCEA Rousse).
-                    </p>
-                  </div>
-                  {privaLoading && (
-                    <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-wider text-muted-foreground">
-                      <RefreshCw className="h-4 w-4 animate-spin text-primary" />
-                      Mise à jour...
-                    </div>
-                  )}
-                </div>
-
-                {privaError && (
-                  <Card className="border-red-500/30 bg-red-500/5 p-4 rounded-2xl flex items-center gap-3">
-                    <AlertTriangle className="h-5 w-5 text-red-500 shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold text-red-600">Erreur lors de la récupération des données</p>
-                      <p className="text-[10px] text-red-500 mt-0.5">{privaError}</p>
-                    </div>
-                  </Card>
-                )}
-
-                {/* Dashboard Cards Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-                  
-                  {/* Card 1: Température Extérieure */}
-                  <Card className="border border-muted-foreground/15 shadow-sm bg-background rounded-2xl">
-                    <CardContent className="p-5 flex items-center gap-4">
-                      <div className="p-3 bg-amber-500/10 text-amber-500 rounded-xl">
-                        <Thermometer className="h-5 w-5" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[9px] text-muted-foreground font-black uppercase tracking-wider truncate">Température Extérieure</p>
-                        <h3 className="text-lg font-black text-foreground mt-0.5">
-                          {privaValues.temp_out ? `${privaValues.temp_out.value} °C` : "N/A"}
-                        </h3>
-                        <p className="text-[9px] text-muted-foreground mt-0.5 font-bold">
-                          {privaValues.temp_out ? `À ${privaValues.temp_out.time}` : "Aucune donnée"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  {/* Card 2: Humidité Extérieure */}
-                  <Card className="border border-muted-foreground/15 shadow-sm bg-background rounded-2xl">
-                    <CardContent className="p-5 flex items-center gap-4">
-                      <div className="p-3 bg-blue-500/10 text-blue-500 rounded-xl">
-                        <Droplets className="h-5 w-5" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[9px] text-muted-foreground font-black uppercase tracking-wider truncate">Humidité Extérieure</p>
-                        <h3 className="text-lg font-black text-foreground mt-0.5">
-                          {privaValues.hum_out ? `${privaValues.hum_out.value} %` : "N/A"}
-                        </h3>
-                        <p className="text-[9px] text-muted-foreground mt-0.5 font-bold">
-                          {privaValues.hum_out ? `À ${privaValues.hum_out.time}` : "Aucune donnée"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  {/* Card 3: Rayonnement Solaire */}
-                  <Card className="border border-muted-foreground/15 shadow-sm bg-background rounded-2xl">
-                    <CardContent className="p-5 flex items-center gap-4">
-                      <div className="p-3 bg-yellow-500/10 text-yellow-500 rounded-xl">
-                        <Sun className="h-5 w-5" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[9px] text-muted-foreground font-black uppercase tracking-wider truncate">Rayonnement Solaire</p>
-                        <h3 className="text-lg font-black text-foreground mt-0.5">
-                          {privaValues.irr_out ? `${privaValues.irr_out.value} W/m²` : "N/A"}
-                        </h3>
-                        <p className="text-[9px] text-muted-foreground mt-0.5 font-bold">
-                          {privaValues.irr_out ? `À ${privaValues.irr_out.time}` : "Aucune donnée"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  {/* Card 4: Vitesse du vent */}
-                  <Card className="border border-muted-foreground/15 shadow-sm bg-background rounded-2xl">
-                    <CardContent className="p-5 flex items-center gap-4">
-                      <div className="p-3 bg-teal-500/10 text-teal-500 rounded-xl">
-                        <Wind className="h-5 w-5" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[9px] text-muted-foreground font-black uppercase tracking-wider truncate">Vitesse du Vent</p>
-                        <h3 className="text-lg font-black text-foreground mt-0.5">
-                          {privaValues.wind_out ? `${privaValues.wind_out.value} m/s` : "N/A"}
-                        </h3>
-                        <p className="text-[9px] text-muted-foreground mt-0.5 font-bold">
-                          {privaValues.wind_out ? `À ${privaValues.wind_out.time}` : "Aucune donnée"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </div>
-
-                {/* Heating and Humidification Detailed Cards */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  
-                  {/* Heating 1 Card */}
-                  <Card className="border border-muted/20 shadow-sm bg-background rounded-2xl">
-                    <CardHeader className="p-4 pb-2 border-b bg-muted/5 flex flex-row items-center gap-2">
-                      <Flame className="h-4 w-4 text-orange-500 animate-pulse" />
-                      <CardTitle className="text-xs font-black uppercase tracking-tight text-foreground">Gestion du Chauffage (Zone 1)</CardTitle>
-                    </CardHeader>
-                    <CardContent className="p-4 grid grid-cols-2 gap-4">
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Consigne Demandée</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.heat_target ? `${privaValues.heat_target.value} °C` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Température Mesurée</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.heat_measured ? `${privaValues.heat_measured.value} °C` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Eau Retour</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.water_ret ? `${privaValues.water_ret.value} °C` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Eau Calculée</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.water_calc ? `${privaValues.water_calc.value} °C` : "N/A"}
-                        </span>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  {/* Humidification 5 Card */}
-                  <Card className="border border-muted/20 shadow-sm bg-background rounded-2xl">
-                    <CardHeader className="p-4 pb-2 border-b bg-muted/5 flex flex-row items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-blue-500 animate-pulse" />
-                      <CardTitle className="text-xs font-black uppercase tracking-tight text-foreground">Brumisation & Humidité (Zone 5)</CardTitle>
-                    </CardHeader>
-                    <CardContent className="p-4 grid grid-cols-2 gap-4">
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Humidité Mesurée</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.hum_measured ? `${privaValues.hum_measured.value} %` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Consigne Limite</span>
-                        <span className="text-base font-black text-foreground mt-1">
-                          {privaValues.hum_target ? `${privaValues.hum_target.value} %` : "N/A"}
-                        </span>
-                      </div>
-                      <div className="bg-muted/5 border border-muted/10 p-3.5 rounded-xl flex flex-col items-center justify-center text-center col-span-2">
-                        <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-wide">Statut de Brumisation</span>
-                        <span className="text-xs font-black text-emerald-500 mt-1">
-                          Fonctionnement normal
-                        </span>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </div>
-
-                {/* Big Searchable catalog of 1719 datapoints */}
-                <Card className="border border-muted/25 shadow-md bg-background rounded-3xl overflow-hidden">
-                  <CardHeader className="p-6 border-b bg-muted/5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-                    <div>
-                      <CardTitle className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
-                        <Search className="h-4.5 w-4.5 text-primary" /> Catalogue Complet des Points de Mesure ({privaCatalog.length})
-                      </CardTitle>
-                      <p className="text-[10px] text-muted-foreground mt-1 font-bold">
-                        Localisez n&apos;importe quel capteur de l&apos;ordinateur climatique et copiez ses identifiants uniques.
-                      </p>
-                    </div>
-                    <div className="w-full md:w-80 shrink-0">
-                      <input
-                        type="text"
-                        placeholder="Rechercher un capteur (ex: temp, ventil, co2...)"
-                        value={privaSearch}
-                        onChange={(e) => setPrivaSearch(e.target.value)}
-                        className="w-full border rounded-xl px-3 py-1.5 text-xs bg-muted/10 focus:outline-none focus:ring-1 focus:ring-primary h-9 font-bold"
-                      />
-                    </div>
-                  </CardHeader>
-                  <CardContent className="p-0 max-h-[400px] overflow-y-auto">
-                    <table className="w-full border-collapse text-left">
-                      <thead>
-                        <tr className="bg-muted/10 border-b text-[9px] uppercase font-black tracking-widest text-muted-foreground">
-                          <th className="p-3 pl-6 w-12 text-center">Sélection</th>
-                          <th className="p-3">Nom de la Variable</th>
-                          <th className="p-3">Unité</th>
-                          <th className="p-3">ID du Capteur (variableId)</th>
-                          <th className="p-3">Matériel (deviceId)</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(() => {
-                          const query = privaSearch.toLowerCase().trim();
-                          const filteredCatalog = privaCatalog.filter(dp => 
-                            dp.name.toLowerCase().includes(query) || 
-                            dp.variableId.toLowerCase().includes(query)
-                          );
-                          
-                          if (filteredCatalog.length === 0) {
-                            return (
-                              <tr>
-                                <td colSpan={5} className="p-8 text-center text-xs text-muted-foreground font-bold">
-                                  Aucune variable ne correspond à votre recherche.
-                                </td>
-                              </tr>
-                            );
-                          }
-
-                          return filteredCatalog.map((dp, idx) => {
-                            const isSelected = isDatapointSelected(dp);
-                            return (
-                              <tr key={idx} className="border-b text-xs hover:bg-muted/5 font-bold text-slate-700 dark:text-slate-300">
-                                <td className="p-3 pl-6 text-center">
-                                  <button
-                                    onClick={() => toggleCatalogDatapoint(dp)}
-                                    className="focus:outline-none hover:scale-110 active:scale-95 transition-transform"
-                                    title={isSelected ? "Désélectionner du graphique" : "Sélectionner pour le graphique"}
-                                  >
-                                    {isSelected ? (
-                                      <CheckSquare className="h-4 w-4 text-primary shrink-0" />
-                                    ) : (
-                                      <Square className="h-4 w-4 text-gray-300 dark:text-gray-600 shrink-0" />
-                                    )}
-                                  </button>
-                                </td>
-                                <td className="p-3 font-bold text-foreground text-[11px]">{dp.name}</td>
-                                <td className="p-3 text-muted-foreground">{dp.unit || "N/A"}</td>
-                                <td className="p-3 font-mono text-[10px] text-primary select-all">{dp.variableId}</td>
-                                <td className="p-3 text-muted-foreground font-mono text-[10px]">{dp.deviceId}</td>
-                              </tr>
-                            );
-                          });
-                        })()}
-                      </tbody>
-                    </table>
-                  </CardContent>
-                </Card>
-              </div>
             ) : (
               /* Agronomic Analysis Tab Content */
               <div className="flex-1 overflow-y-auto bg-muted/10 p-6 md:p-10 space-y-6 max-h-[calc(100vh-3.5rem)] select-none">
+                {/* Independent date range - deliberately decoupled from the Climat/Croissance chart's
+                    range, so browsing a different period here (ex: la semaine passée) never changes
+                    what the main chart shows, and vice-versa. */}
+                <div className="bg-background border border-border p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-sm">
+                  <div className="flex flex-col gap-0.5">
+                    <h4 className="text-xs font-black uppercase text-foreground flex items-center gap-1.5">
+                      <ChartIcon className="h-4 w-4 text-primary" /> Période d&apos;Analyse Agronomique
+                    </h4>
+                    <p className="text-[10px] text-muted-foreground font-semibold">Indépendante de la plage du graphique Climat/Croissance.</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="date"
+                      value={agroStartDateDraft}
+                      onChange={(e) => handleAgroStartDateDraftChange(e.target.value)}
+                      className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                    />
+                    <span className="text-xs text-muted-foreground font-bold">à</span>
+                    <input
+                      type="date"
+                      value={agroEndDateDraft}
+                      onChange={(e) => handleAgroEndDateDraftChange(e.target.value)}
+                      className="border rounded-xl px-2.5 py-1 text-xs font-bold bg-background focus:outline-none focus:ring-1 focus:ring-primary h-8"
+                    />
+                    {agroLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin text-primary ml-1" />}
+                  </div>
+                </div>
+
+                {agroError && (
+                  <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 text-xs font-bold">
+                    {agroError}
+                  </div>
+                )}
+                {agroPrivaChartError && (
+                  <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-600 text-xs font-bold">
+                    {agroPrivaChartError}
+                  </div>
+                )}
+
                 {/* Model calibration settings */}
                 <div className="bg-background border border-border p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-sm">
                   <div className="flex flex-col gap-0.5">
@@ -3633,15 +5323,54 @@ export default function AranetUnifiedDashboard() {
                   </div>
                 </div>
 
+                {/* Agent IA agronomique persistant : ce que l'historique de cette serre a
+                    statistiquement montré - support de l'analyse ci-dessous, pas un onglet séparé.
+                    La base bibliographique elle-même n'a pas d'UI dashboard : elle s'alimente
+                    depuis le dossier agro-literature-docs/ via `npm run ingest:agro-literature`
+                    (voir agro-literature-docs/README.md). */}
+                <Card className="border border-muted-foreground/15 shadow-sm rounded-2xl overflow-hidden">
+                  <CardHeader className="p-4 pb-2 border-b bg-muted/5">
+                    <CardTitle className="text-xs font-black uppercase tracking-tight text-primary flex items-center gap-1.5">
+                      <Sparkles className="h-4 w-4" /> Corrélations apprises sur cette serre
+                    </CardTitle>
+                    <CardDescription className="text-[10px]">
+                      Coefficient de corrélation (Pearson) entre chaque facteur mesuré et le gain de croissance, calculé sur l&apos;historique enregistré. Les plages cibles, spécifiques à chaque créneau horaire, apparaissent dans le détail du jour ci-dessous.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-4 max-h-[220px] overflow-y-auto space-y-1.5">
+                    {agroCorrelationsInsufficient ? (
+                      <div className="text-center py-6 text-[10px] text-muted-foreground font-semibold">
+                        Historique insuffisant pour calculer des corrélations fiables{agroCorrelationsSampleSize !== null ? ` (${agroCorrelationsSampleSize}/10 jours enregistrés)` : ""}. Continuez à consulter cet onglet pour l&apos;alimenter.
+                      </div>
+                    ) : agroCorrelations.length === 0 ? (
+                      <div className="text-center py-6 text-[10px] text-muted-foreground font-semibold">
+                        Aucune corrélation calculée pour l&apos;instant.
+                      </div>
+                    ) : (
+                      agroCorrelations.slice(0, 12).map((c: any) => {
+                        const label = formatAgroFactorLabel(c.factor_key);
+                        const abs = Math.abs(c.coefficient);
+                        const strength = abs >= 0.5 ? "text-emerald-600" : abs >= 0.3 ? "text-amber-600" : "text-muted-foreground";
+                        return (
+                          <div key={`${c.factor_key}-${c.target}`} className="flex items-center justify-between text-[11px] border-b last:border-0 border-muted/20 py-1">
+                            <span className="font-bold text-foreground truncate">{label}</span>
+                            <span className={`font-mono font-black ${strength}`}>r={c.coefficient.toFixed(2)} <span className="text-muted-foreground font-normal">(n={c.sample_size})</span></span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </CardContent>
+                </Card>
+
                 {/* Warning if radiation sum is not selected in chart data */}
                 {(() => {
-                  const hasRadiationData = dynamicAgronomicData.some(d => d.radiationSumJcm2 !== null);
+                  const hasRadiationData = agronomicDataWithBenchmark.some(d => d.radiationSumJcm2 !== null);
                   if (!hasRadiationData) {
                     return (
                       <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold flex items-center gap-3 shadow-sm">
                         <AlertTriangle className="h-5 w-5 shrink-0 text-amber-500" />
                         <div>
-                          <span>Sélection requise : Veuillez cocher la variable de rayonnement cumulé (ex: <b>Somme de rayonnement global en J/cm²</b>) sous l&apos;onglet <i>Ordinateur Climatique</i> pour activer le calcul dynamique du potentiel de gain et de ses pertes.</span>
+                          <span>Sélection requise : Veuillez cocher la variable de rayonnement cumulé (ex: <b>Somme de rayonnement global en J/cm²</b>) dans l&apos;onglet <i>Sélection des données</i> pour activer le calcul dynamique du potentiel de gain et de ses pertes.</span>
                         </div>
                       </div>
                     );
@@ -3651,22 +5380,22 @@ export default function AranetUnifiedDashboard() {
 
                 {/* Global Performance Summary Cards */}
                 {(() => {
-                  const daysCount = dynamicAgronomicData.length;
+                  const daysCount = agronomicDataWithBenchmark.length;
                   if (daysCount === 0) {
                     return (
                       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 w-full">
                         <Card className="border-none shadow-md bg-background rounded-2xl md:col-span-4 p-8 text-center text-xs text-muted-foreground font-bold">
-                          Aucune donnée disponible pour l'analyse. Veuillez d'abord charger les données dans l'onglet Graphique.
+                          Aucune donnée disponible pour cette période. Vérifiez la plage de dates ci-dessus, ou sélectionnez des capteurs dans l&apos;onglet &quot;Sélection des données&quot;.
                         </Card>
                       </div>
                     );
                   }
 
-                  const hasRadiationData = dynamicAgronomicData.some(d => d.radiationSumJcm2 !== null);
-                  const avgScore = Math.round(dynamicAgronomicData.reduce((sum, d) => sum + d.overallScore, 0) / daysCount);
-                  const totalLoss = dynamicAgronomicData.reduce((sum, d) => sum + d.potentialGain, 0);
-                  const optimalDays = dynamicAgronomicData.filter(d => d.status === "Optimal").length;
-                  const alertDays = dynamicAgronomicData.filter(d => d.status === "Alerte Climat").length;
+                  const hasRadiationData = agronomicDataWithBenchmark.some(d => d.radiationSumJcm2 !== null);
+                  const avgScore = Math.round(agronomicDataWithBenchmark.reduce((sum, d) => sum + d.overallScore, 0) / daysCount);
+                  const totalLoss = agronomicDataWithBenchmark.reduce((sum, d) => sum + (d.lostGainVsBestDay ?? 0), 0);
+                  const optimalDays = agronomicDataWithBenchmark.filter(d => d.status === "Optimal").length;
+                  const alertDays = agronomicDataWithBenchmark.filter(d => d.status === "Alerte Climat").length;
 
                   return (
                     <div className="grid grid-cols-1 md:grid-cols-5 gap-6 w-full">
@@ -3696,8 +5425,8 @@ export default function AranetUnifiedDashboard() {
                               {hasRadiationData ? `-${totalLoss.toFixed(1)} g/m²` : "N/A"}
                             </h3>
                             <p className="text-[9px] text-rose-500 font-bold mt-1 leading-snug">
-                              {hasRadiationData 
-                                ? `L'optimisation de la conduite, malgré le climat extérieur, aurait pu faire gagner ${totalLoss.toFixed(1)} g/m² supplémentaire.`
+                              {hasRadiationData
+                                ? `Par rapport à la meilleure journée d'efficience lumière/gain de la plage affichée, ${totalLoss.toFixed(1)} g/m² supplémentaire aurait été atteignable.`
                                 : "Cochez la variable Somme de Rayonnement (J/cm²) pour afficher le potentiel perdu."
                               }
                             </p>
@@ -3735,8 +5464,81 @@ export default function AranetUnifiedDashboard() {
                 })()}
 
                 {/* Main Grid */}
-                {dynamicAgronomicData.length > 0 ? (
+                {agronomicDataWithBenchmark.length > 0 ? (
                   <div className="space-y-6 w-full">
+                    {/* Potentiel (meilleure efficience prouvée par cette serre) vs gain réellement
+                        réalisé, jour par jour, tous deux exprimés en g / 100 J/cm² de rayonnement
+                        reçu - une unité à échelle humaine plutôt que le ratio brut g/m² par J/cm². */}
+                    <Card className="border border-border/80 shadow-md bg-background rounded-2xl overflow-hidden">
+                      <CardHeader className="p-5 pb-3 border-b bg-muted/5">
+                        <CardTitle className="text-xs font-black uppercase tracking-tight flex items-center gap-2">
+                          <Gauge className="h-4 w-4 text-primary" /> Potentiel vs Gain Réalisé (g / 100 J/cm²)
+                        </CardTitle>
+                        <CardDescription className="text-[10px] font-semibold mt-0.5">
+                          Le potentiel est l&apos;efficience lumière→croissance de la meilleure journée observée sur la période (référence prouvée par cette serre). L&apos;écart avec le réalisé, jour par jour, indique la marge de gain non exploitée.
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="p-4">
+                        <div className="w-full h-[320px]">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={agronomicDataWithBenchmark} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+                              <XAxis
+                                dataKey="dateStr"
+                                tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
+                                axisLine={false}
+                                tickLine={false}
+                                dy={5}
+                              />
+                              <YAxis
+                                tick={{ fontSize: 8, fill: "#64748b" }}
+                                width={32}
+                                label={{ value: "g / 100 J/cm²", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fill: "#64748b", fontSize: 8, fontWeight: "bold" } }}
+                              />
+                              <Tooltip content={({ active, payload, label }: any) => {
+                                if (!active || !payload || !payload.length) return null;
+                                const day = agronomicDataWithBenchmark.find((d: any) => d.dateStr === label);
+                                return (
+                                  <div className="bg-background border border-muted-foreground/20 p-2.5 rounded-xl shadow-lg space-y-1 text-[11px] z-30">
+                                    <p className="font-bold text-foreground">{label}</p>
+                                    {payload.map((item: any) => (
+                                      <p key={item.dataKey} style={{ color: item.color }} className="font-semibold">
+                                        {item.name} : {item.value !== null && item.value !== undefined ? `${item.value} g / 100 J/cm²` : "N/A"}
+                                      </p>
+                                    ))}
+                                    {day?.lostPercentVsBestDay !== null && day?.lostPercentVsBestDay !== undefined && (
+                                      <p className="text-rose-500 font-bold pt-1 border-t border-border/30 mt-1">
+                                        ⚠️ {day.lostPercentVsBestDay}% sous le potentiel prouvé
+                                      </p>
+                                    )}
+                                  </div>
+                                );
+                              }} />
+                              <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
+
+                              <Line type="monotone" dataKey="potentialEfficiencyPer100J" name="Potentiel" stroke="#7c3aed" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={true} isAnimationActive={false} />
+                              <Line type="monotone" dataKey="realizedEfficiencyPer100J" name="Réalisé" stroke="#22c55e" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={true} isAnimationActive={false} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+
+                        {/* Per-day limiting factor recap, so the bottleneck is readable at a glance
+                            without having to hover every point of the chart. */}
+                        <div className="flex flex-wrap gap-1.5 mt-3 pt-3 border-t">
+                          {agronomicDataWithBenchmark.map((d: any) => (
+                            <div key={`limiting-${d.dateStr}`} className="px-2 py-1 rounded-lg bg-muted/20 border border-border/40 text-[9px] font-semibold flex items-center gap-1.5">
+                              <span className="font-black text-foreground">{d.dateStr}</span>
+                              {d.limitingFactorLabel ? (
+                                <span className="text-rose-500">{d.limitingFactorLabel} ({d.limitingFactorScore})</span>
+                              ) : (
+                                <span className="text-muted-foreground opacity-60">Données insuffisantes</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </CardContent>
+                    </Card>
+
                     {/* Full Width Table Card */}
                     <Card className="border border-border/80 shadow-md bg-background rounded-2xl overflow-hidden">
                       <CardHeader className="p-5 pb-3 border-b bg-muted/5">
@@ -3751,24 +5553,17 @@ export default function AranetUnifiedDashboard() {
                               <th className="p-3 pl-5">Jour / Date</th>
                               <th className="p-3 text-center">Gain Cumulé (g/m²)</th>
                               <th className="p-3 text-center">Somme de Rayonnement (J/cm²)</th>
-                              <th className="p-3 text-center">Perte de Poids Brutale</th>
-                              <th className="p-3 text-center">Événement Externe</th>
-                              <th className="p-3 text-center">Potentiel Biomasse (g/m²)</th>
+                              <th className="p-3 text-center">Mouvements de Poids (g/m²)</th>
+                              <th className="p-3 text-center">Nature</th>
+                              <th className="p-3 text-center">Efficience (g / 100 J/cm²)</th>
+                              <th className="p-3 text-center">Perte vs Meilleur Jour</th>
                               <th className="p-3 text-center">Analyse Agro (Score)</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {dynamicAgronomicData.map(d => {
-                              const isActive = d.day === selectedDayNum || (selectedDayNum > dynamicAgronomicData.length && d.day === 1);
-                              
-                              const handleEventChange = (value: "none" | "harvest" | "thinning" | "descent") => {
-                                setDailyEventsDraft(prev => ({
-                                  ...prev,
-                                  [d.dateStr]: value
-                                }));
-                              };
-
-                              const eventValue = dailyEventsDraft[d.dateStr] || "none";
+                            {agronomicDataWithBenchmark.map(d => {
+                              const isActive = d.day === selectedDayNum || (selectedDayNum > agronomicDataWithBenchmark.length && d.day === 1);
+                              const dayDrops: WeightDropCandidate[] = d.drops || [];
 
                               return (
                                 <tr
@@ -3798,52 +5593,71 @@ export default function AranetUnifiedDashboard() {
                                     {d.radiationSumJcm2 !== null ? `${d.radiationSumJcm2} J/cm²` : "N/A"}
                                   </td>
 
-                                  {/* Perte Brutale */}
+                                  {/* Every detected movement is auto-smoothed (see buildChartRows) - a consequence
+                                      of past growth/logistics, not a growth loss, so it's shown neutrally rather
+                                      than as a "perte". */}
                                   <td className="p-3 text-center text-[10px]">
-                                    {d.suddenDropVal > 0 ? (
-                                      <span className="text-rose-600 font-bold bg-rose-500/10 px-2 py-0.5 rounded-md border border-rose-500/10 inline-block font-mono">
-                                        {d.suddenDropTime} : -{d.suddenDropVal} g/m²
-                                      </span>
+                                    {dayDrops.length > 0 ? (
+                                      <div className="flex flex-col gap-1 items-center">
+                                        {dayDrops.map(drop => (
+                                          <span key={drop.id} className="text-slate-600 dark:text-slate-300 font-bold bg-slate-500/10 px-2 py-0.5 rounded-md border border-slate-500/10 inline-block font-mono">
+                                            {drop.timeStr} : {drop.suddenDropVal} g/m²
+                                          </span>
+                                        ))}
+                                      </div>
                                     ) : (
                                       <span className="text-muted-foreground opacity-60">Aucune</span>
                                     )}
                                   </td>
 
-                                  {/* Événement Externe Dropdown */}
-                                  <td className="p-3 text-center" onClick={(e) => e.stopPropagation()}>
-                                    <div className="flex items-center justify-center gap-2">
-                                      <select
-                                        value={eventValue}
-                                        onChange={(e) => handleEventChange(e.target.value as any)}
-                                        className="bg-background border rounded-lg px-2 py-1 text-[10px] font-black uppercase text-foreground focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer shadow-sm"
-                                      >
-                                        <option value="none">Aucun</option>
-                                        <option value="harvest">Récolte</option>
-                                        <option value="thinning">Effeuillage</option>
-                                        <option value="descent">Descente</option>
-                                      </select>
-
-                                      {(eventValue === "harvest" || eventValue === "thinning" || eventValue === "descent") && (
-                                        <div className="flex items-center gap-1 bg-background border rounded-lg px-1.5 py-0.5 shadow-sm w-24">
-                                          <input
-                                            type="number"
-                                            value={dailyAdjustedWeightsDraft[d.dateStr] !== undefined ? dailyAdjustedWeightsDraft[d.dateStr] : d.suggestedCorrectionGrams}
-                                            onChange={(e) => setDailyAdjustedWeightsDraft(prev => ({ 
-                                              ...prev, 
-                                              [d.dateStr]: Math.max(0, parseFloat(e.target.value) || 0) 
-                                            }))}
-                                            className="w-12 bg-transparent text-center font-mono font-bold text-[10px] focus:outline-none"
-                                            title="Poids estimatif de la perte"
-                                          />
-                                          <span className="text-[8px] font-bold text-muted-foreground uppercase">g</span>
-                                        </div>
-                                      )}
-                                    </div>
+                                  {/* Nature du mouvement - read-only here (auto-caractérisé) ; l'édition se fait
+                                      dans l'onglet "Mouvements de Poids". */}
+                                  <td className="p-3 text-center">
+                                    {dayDrops.length === 0 ? (
+                                      <span className="text-muted-foreground opacity-60 text-[10px]">—</span>
+                                    ) : (
+                                      <div className="flex flex-col gap-1 items-center">
+                                        {dayDrops.map(drop => {
+                                          const eventValue = dailyEvents[drop.id] || drop.autoEventType;
+                                          const label = eventValue === "harvest" ? "Récolte"
+                                            : eventValue === "thinning" ? "Effeuillage"
+                                            : eventValue === "descent" ? "Descente"
+                                            : eventValue === "recalibration" ? "Recalibrage"
+                                            : "Arrosage";
+                                          return (
+                                            <span
+                                              key={drop.id}
+                                              className="px-2 py-0.5 rounded-lg text-[10px] font-black uppercase bg-emerald-500/10 text-emerald-600 border border-emerald-500/20"
+                                            >
+                                              {drop.timeStr} · {label}
+                                            </span>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
                                   </td>
 
-                                  {/* Potentiel Biomasse */}
+                                  {/* Efficience (gain / rayonnement) */}
                                   <td className="p-3 text-center font-mono font-bold text-slate-700 dark:text-slate-300 text-[11px]">
-                                    {d.yieldPotentialGrams !== null ? `${d.yieldPotentialGrams} g/m²` : "N/A"}
+                                    {d.realizedEfficiencyPer100J !== null ? d.realizedEfficiencyPer100J : "N/A"}
+                                    {d.bestEfficiencyInRange !== null && d.growthEfficiency !== null && d.growthEfficiency >= d.bestEfficiencyInRange && (
+                                      <span title="Meilleur jour de la plage" className="ml-1">🏆</span>
+                                    )}
+                                  </td>
+
+                                  {/* Perte vs meilleure journée d'efficience de la plage affichée */}
+                                  <td className="p-3 text-center text-[10px]">
+                                    {d.lostGainVsBestDay !== null ? (
+                                      d.lostGainVsBestDay > 0 ? (
+                                        <span className="text-rose-600 font-bold bg-rose-500/10 px-2 py-0.5 rounded-md border border-rose-500/10 inline-block font-mono">
+                                          -{d.lostGainVsBestDay} g/m² ({d.lostPercentVsBestDay}%)
+                                        </span>
+                                      ) : (
+                                        <span className="text-emerald-600 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/10 inline-block">Référence</span>
+                                      )
+                                    ) : (
+                                      <span className="text-muted-foreground opacity-60">N/A</span>
+                                    )}
                                   </td>
 
                                   {/* Analyse Agro */}
@@ -3866,17 +5680,17 @@ export default function AranetUnifiedDashboard() {
                     {/* Selected Day Audit Detail */}
                     <div className="w-full space-y-6">
                       {(() => {
-                        const day = dynamicAgronomicData.find(d => d.day === selectedDayNum) || dynamicAgronomicData[0]
+                        const day = agronomicDataWithBenchmark.find(d => d.day === selectedDayNum) || agronomicDataWithBenchmark[0]
                         return (
                           <Card className="border-none shadow-md bg-background overflow-hidden rounded-2xl">
                             <CardHeader className="p-6 pb-3 border-b bg-muted/15 flex flex-row items-center justify-between">
                               <div>
                                 <CardTitle className="text-sm font-black uppercase tracking-tight flex flex-col gap-1">
-                                  <span>Audit du {day.dateStr} — Score : {day.overallScore}/100</span>
+                                  <span>Analyse du {day.dateStr} — Score : {day.overallScore}/100</span>
                                   <span className="text-[10px] text-muted-foreground font-bold tracking-wider uppercase mt-0.5">
                                     {day.radiationSumJcm2 !== null ? (
                                       <>
-                                        Somme de Radiation : <span className="text-primary">{day.radiationSumJcm2} J/cm²</span> | Potentiel Optimal : <span className="text-emerald-600">{day.yieldPotentialGrams} g/m²</span> | Perte : <span className="text-rose-600">-{day.potentialGain} g/m²</span>
+                                        Somme de Radiation : <span className="text-primary">{day.radiationSumJcm2} J/cm²</span> | Efficience : <span className="text-emerald-600">{day.realizedEfficiencyPer100J !== null ? day.realizedEfficiencyPer100J : "N/A"} g / 100 J/cm²</span> | Perte vs meilleur jour : <span className="text-rose-600">-{day.lostGainVsBestDay ?? 0} g/m²</span>
                                       </>
                                     ) : (
                                       <span className="text-rose-500 font-black">⚠️ Somme de rayonnement (J/cm²) non sélectionnée sur le graphique</span>
@@ -3890,123 +5704,92 @@ export default function AranetUnifiedDashboard() {
                             </CardHeader>
                             
                             <CardContent className="p-6 space-y-6">
-                              {/* Target ranges */}
-                              <div className="space-y-4">
-                                <h4 className="text-[10px] font-black uppercase tracking-widest text-muted-foreground border-b pb-1.5 flex items-center gap-1.5">
-                                  <Maximize2 className="h-3.5 w-3.5 text-emerald-500" /> Facteurs Limitant le Gain Cumulé
-                                </h4>
-
-                                <div className="space-y-4">
-                                  {day.audits.map((audit) => {
-                                    const isOptimal = audit.status === "optimal"
-                                    const isMissing = audit.status === "missing"
-                                    
-                                    if (isMissing) {
-                                      return (
-                                        <div key={audit.name} className="p-3 rounded-xl bg-muted/10 border border-border/20 border-dashed space-y-1">
-                                          <div className="flex justify-between items-center text-xs opacity-60">
-                                            <span className="font-bold text-muted-foreground">{audit.name}</span>
-                                            <Badge className="font-black text-[9px] bg-muted/40 text-muted-foreground/60 border border-muted-foreground/10">Non surveillé</Badge>
-                                          </div>
-                                          <p className="text-[10px] text-muted-foreground font-semibold mt-1">
-                                            {audit.impact}
-                                          </p>
-                                        </div>
-                                      );
-                                    }
-
-                                    const percentApplied = ((audit.applied - (audit.targetMin - 2)) / ((audit.targetMax + 2) - (audit.targetMin - 2))) * 100
-                                    const clampedPercent = Math.max(5, Math.min(95, percentApplied))
-                                    
-                                    return (
-                                      <div key={audit.name} className="p-3 rounded-xl bg-muted/20 border border-border/50 space-y-2">
-                                        <div className="flex justify-between items-center text-xs">
-                                          <div>
-                                            <span className="font-bold text-foreground">{audit.name}</span>
-                                            <span className="text-[10px] text-muted-foreground font-semibold ml-1.5">
-                                              (Cible : {audit.targetMin} - {audit.targetMax} {audit.unit})
-                                            </span>
-                                          </div>
-                                          <div className="flex items-center gap-1.5">
-                                            <span className="text-[10px] text-muted-foreground">Relevé :</span>
-                                            <Badge className={`font-black text-[10px] ${
-                                              audit.status === "optimal" 
-                                                ? "bg-emerald-500 text-white" 
-                                                : "bg-rose-500 text-white"
-                                            }`}>
-                                              {audit.applied} {audit.unit}
-                                            </Badge>
-                                          </div>
-                                        </div>
-
-                                        {/* Slider visual */}
-                                        <div className="relative pt-3 pb-1">
-                                          <div className="h-1.5 w-full bg-slate-200 dark:bg-slate-800 rounded-full relative">
-                                            <div 
-                                              className="absolute h-1.5 bg-emerald-400 rounded-full opacity-50" 
-                                              style={{ left: "25%", right: "25%" }} 
-                                            />
-                                            <div 
-                                              className={`absolute h-3 w-3 -top-0.5 rounded-full border border-white shadow-md transition-all ${
-                                                audit.status === "optimal" ? "bg-emerald-500" : "bg-rose-500"
-                                              }`}
-                                              style={{ left: `${clampedPercent}%`, transform: 'translateX(-50%)' }}
-                                            />
-                                          </div>
-                                          
-                                          <div className="flex justify-between text-[8px] font-bold text-slate-400 pt-1.5">
-                                            <span>Bas ({audit.targetMin - 1} {audit.unit})</span>
-                                            <span className="text-emerald-500">Cible Min ({audit.targetMin})</span>
-                                            <span className="text-emerald-500">Cible Max ({audit.targetMax})</span>
-                                            <span>Élevé ({audit.targetMax + 1} {audit.unit})</span>
-                                          </div>
-                                        </div>
-
-                                        <div className="flex justify-between items-center text-[10px] font-semibold">
-                                          <p className={isOptimal ? "text-emerald-600" : "text-rose-500"}>
-                                            {isOptimal ? "✓ Performance optimale atteinte." : `✗ ${audit.impact}`}
-                                          </p>
-                                          {!isOptimal && (
-                                            <span className="text-[9px] uppercase font-black text-rose-400 bg-rose-500/5 px-2 py-0.5 rounded-md border border-rose-500/10">
-                                              Origine : {audit.origin}
-                                            </span>
-                                          )}
-                                        </div>
+                              {/* Facteur limitant par plage horaire - où, dans la journée, un
+                                  facteur est sorti de la plage cible et a probablement bridé le
+                                  gain, plutôt qu'un seul verdict journalier agrégé. */}
+                              {day.limitingFactorsBySlot && (
+                                <div className="flex flex-col gap-2">
+                                  <h4 className="text-xs font-black text-foreground uppercase tracking-wider flex items-center gap-1.5">
+                                    <Gauge className="h-3.5 w-3.5 text-primary" /> Facteur limitant par plage horaire
+                                  </h4>
+                                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                                    {day.limitingFactorsBySlot.map((slot: any) => (
+                                      <div
+                                        key={slot.label}
+                                        className={`p-2.5 rounded-xl border text-center ${slot.limitingFactor ? "bg-rose-500/5 border-rose-500/20" : "bg-emerald-500/5 border-emerald-500/20"}`}
+                                      >
+                                        <p className="text-[9px] font-black uppercase text-muted-foreground tracking-wider">{slot.label}</p>
+                                        {slot.limitingFactor ? (
+                                          <>
+                                            <p className="text-[11px] font-black text-rose-600 mt-1 truncate">{formatAgroFactorLabel(slot.limitingFactor.field)}</p>
+                                            <p className="text-[9px] text-muted-foreground font-semibold">{slot.limitingFactor.value} (cible {slot.limitingFactor.range.min}–{slot.limitingFactor.range.max})</p>
+                                          </>
+                                        ) : (
+                                          <p className="text-[11px] font-black text-emerald-600 mt-1">Optimal</p>
+                                        )}
                                       </div>
-                                    )
-                                  })}
+                                    ))}
+                                  </div>
                                 </div>
-                              </div>
+                              )}
 
-                              {/* Agronomic / Economic explanations */}
-                              <div className="p-4 bg-slate-900/5 dark:bg-slate-100/5 rounded-xl border border-border/50 flex gap-3">
-                                <div className="p-2 bg-emerald-500 text-white rounded-lg h-fit shrink-0">
-                                  <Leaf className="h-4 w-4" />
-                                </div>
-                                <div>
-                                  <h4 className="text-xs font-black text-foreground uppercase tracking-wider mb-1">Commentaire Physiologique</h4>
-                                  <p className="text-xs text-muted-foreground leading-relaxed font-semibold">
-                                    {day.physiologicalExplanation}
-                                  </p>
-                                </div>
-                              </div>
-
-                              {/* Step-by-Step Action Plan */}
-                              <div className="space-y-3">
-                                <h4 className="text-[10px] font-black uppercase tracking-widest text-muted-foreground border-b pb-1.5 flex items-center gap-1.5">
-                                  <Lightbulb className="h-3.5 w-3.5 text-amber-500" /> Actions Recommandées
-                                </h4>
-                                <ul className="space-y-2">
-                                  {day.actionPlan.map((action, index) => (
-                                    <li key={index} className="flex gap-2.5 items-start text-xs font-semibold text-slate-700 dark:text-slate-300">
-                                      <div className="h-4 w-4 rounded-full bg-emerald-500/10 text-emerald-500 flex items-center justify-center text-[9px] font-black shrink-0 mt-0.5">
-                                        {index + 1}
+                              {/* AI black-box analysis trigger + result */}
+                              {(() => {
+                                const aiResult = aiAnalysisByDay[day.dateStr];
+                                const isLoading = !!aiAnalysisLoading[day.dateStr];
+                                const aiError = aiAnalysisError[day.dateStr];
+                                return (
+                                  <div className="p-4 bg-primary/5 rounded-xl border border-primary/20 flex flex-col gap-3">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <h4 className="text-xs font-black text-foreground uppercase tracking-wider flex items-center gap-1.5">
+                                        <Sparkles className="h-3.5 w-3.5 text-primary" /> Analyse IA (Boîte Noire)
+                                      </h4>
+                                      <Button
+                                        size="sm"
+                                        disabled={isLoading}
+                                        onClick={() => handleAnalyzeDayWithAI(day)}
+                                        className="bg-primary hover:bg-primary/90 text-white font-black text-[10px] uppercase h-7 px-3 rounded-lg shadow-sm"
+                                      >
+                                        {isLoading ? (
+                                          <span className="flex items-center gap-1.5"><RefreshCw className="h-3 w-3 animate-spin" /> Analyse...</span>
+                                        ) : aiResult ? "Ré-analyser" : "Analyser avec l'IA"}
+                                      </Button>
+                                    </div>
+                                    {aiError && (
+                                      <p className="text-[10px] text-rose-500 font-bold">{aiError}</p>
+                                    )}
+                                    {aiResult && (
+                                      <div className="space-y-2">
+                                        <Badge className="font-black text-[9px] bg-primary/10 text-primary border-primary/20">
+                                          {aiResult.keyLimitingFactor}
+                                        </Badge>
+                                        <p className="text-xs text-muted-foreground leading-relaxed font-semibold">
+                                          {aiResult.explanation}
+                                        </p>
                                       </div>
-                                      <span>{action}</span>
-                                    </li>
-                                  ))}
-                                </ul>
-                              </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+
+                              {/* Step-by-Step Action Plan - sourced from the AI analysis only, once run for this day */}
+                              {aiAnalysisByDay[day.dateStr]?.actionPlan && aiAnalysisByDay[day.dateStr].actionPlan.length > 0 && (
+                                <div className="space-y-3">
+                                  <h4 className="text-[10px] font-black uppercase tracking-widest text-muted-foreground border-b pb-1.5 flex items-center gap-1.5">
+                                    <Lightbulb className="h-3.5 w-3.5 text-amber-500" /> Actions Recommandées
+                                  </h4>
+                                  <ul className="space-y-2">
+                                    {aiAnalysisByDay[day.dateStr].actionPlan.map((action: string, index: number) => (
+                                      <li key={index} className="flex gap-2.5 items-start text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                        <div className="h-4 w-4 rounded-full bg-emerald-500/10 text-emerald-500 flex items-center justify-center text-[9px] font-black shrink-0 mt-0.5">
+                                          {index + 1}
+                                        </div>
+                                        <span>{action}</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
                             </CardContent>
                           </Card>
                         )

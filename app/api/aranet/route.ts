@@ -142,14 +142,14 @@ export async function GET(request: NextRequest) {
       const hours = searchParams.get("hours");
       const days = searchParams.get("days");
       const unitId = searchParams.get("unit");
+      const metricId = searchParams.get("metric");
 
-      const historyCacheKey = `history_${sensorId}_${hours || ""}_${days || ""}_${unitId || ""}`;
+      const historyCacheKey = `history_${sensorId}_${hours || ""}_${days || ""}_${unitId || ""}_${metricId || ""}`;
       const cachedHistory = getFromCache(historyCacheKey);
       if (cachedHistory) {
         return NextResponse.json(cachedHistory);
       }
 
-      let historyUrl = `${BASE_URL}/measurements/history`;
       const params = new URLSearchParams();
 
       if (sensorId) params.append("sensor", sensorId);
@@ -172,23 +172,60 @@ export async function GET(request: NextRequest) {
       }
       
       if (unitId) params.append("unit", unitId);
-      
+      if (metricId) params.append("metric", metricId);
+
       // Default to 24 hours if no valid duration is set
       if (!hasDuration) {
         params.append("hours", "24");
       }
 
-      if (params.toString()) {
-        historyUrl += `?${params.toString()}`;
+      // Aranet's history endpoint caps each response at 10000 readings, even scoped to a single
+      // metric - a frequently-reporting sensor (e.g. the scale/plant_weight_gain probe) can hit
+      // that cap in under a week, silently truncating the rest of a longer requested range (found
+      // via the Mouvements de Poids chart going blank mid-range for a 26-day window). "from"
+      // anchors the window start (confirmed empirically - "to"/"start"/"end"/"after" are all
+      // ignored by this API), so we page forward from the last returned timestamp until the
+      // cursor reaches "now" or a page comes back empty. A page returning fewer than the cap is
+      // NOT a reliable "no more data" signal on its own (observed a 9999-reading page mid-range,
+      // not the full cap, followed by more data still further ahead) - only an empty page or
+      // reaching "now" means there's nothing left to fetch.
+      const MAX_PAGES = 12; // 12 x ~7 days for a busy sensor comfortably covers the 30-day max range
+      const windowStart = new Date();
+      if (hasDuration && days) {
+        windowStart.setDate(windowStart.getDate() - parseInt(days, 10));
+      } else if (hasDuration && hours) {
+        windowStart.setHours(windowStart.getHours() - parseInt(hours, 10));
+      } else {
+        windowStart.setHours(windowStart.getHours() - 24);
       }
 
-      const historyRes = await fetch(historyUrl, { headers });
-      if (!historyRes.ok) throw new Error(`Failed to fetch history: ${historyRes.statusText}`);
-      const historyData = await historyRes.json();
+      const allReadings: any[] = [];
+      let cursor = windowStart;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const pageParams = new URLSearchParams(params);
+        pageParams.delete("hours");
+        pageParams.delete("days");
+        pageParams.set("from", cursor.toISOString());
+
+        const pageRes = await fetch(`${BASE_URL}/measurements/history?${pageParams.toString()}`, { headers });
+        if (!pageRes.ok) throw new Error(`Failed to fetch history: ${pageRes.statusText}`);
+        const pageData = await pageRes.json();
+        const pageReadings: any[] = pageData.readings || [];
+        if (pageReadings.length === 0) break;
+
+        allReadings.push(...pageReadings);
+
+        const latest = pageReadings.reduce((max: string, r: any) => (r.time > max ? r.time : max), pageReadings[0].time);
+        const nextCursor = new Date(latest);
+        nextCursor.setSeconds(nextCursor.getSeconds() + 1);
+        if (nextCursor.getTime() <= cursor.getTime()) break; // safety: no forward progress
+        if (nextCursor.getTime() >= Date.now()) break; // reached "now" - nothing more to fetch
+        cursor = nextCursor;
+      }
 
       const responseHistoryData = {
         success: true,
-        readings: historyData.readings || [],
+        readings: allReadings,
         timestamp: new Date().toISOString()
       };
       setToCache(historyCacheKey, responseHistoryData, 300); // 5 minutes cache
