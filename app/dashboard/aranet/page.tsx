@@ -44,7 +44,8 @@ import {
   Legend,
   Brush,
   ResponsiveContainer,
-  ReferenceLine
+  ReferenceLine,
+  ReferenceArea
 } from "recharts";
 
 // Definition of all 20 plottable metrics with their available units
@@ -899,6 +900,9 @@ export default function AranetUnifiedDashboard() {
   }, [customPrivaMetrics, customPrivaMetricsDraft]);
 
   const [activeTab, setActiveTab] = useState<"agronomic" | "selection" | "charts" | "chutes" | "fertigation">("charts");
+  // Sub-tab within Climat/Croissance: the existing sensor chart, or the new photosynthesis
+  // efficiency (Aréel/IVL) chart - see photosynthesisChartData below.
+  const [climatSubTab, setClimatSubTab] = useState<"data" | "efficiency">("data");
   const [selectedDayNum, setSelectedDayNum] = useState<number>(1);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([
     "temp_rh_top_1",
@@ -2536,6 +2540,67 @@ export default function AranetUnifiedDashboard() {
     [rawDataMap, selectedKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, timeStep, manualDrops]
   );
 
+  // Resolves a role-tagged (or, failing that, name-matched) sensor key from the validated
+  // Climat/Croissance selection - same "tag first, name fallback" pattern as keysByRole inside
+  // dynamicAgronomicData, but scoped to selectedKeys/metricConfigs (this chart's own selection)
+  // rather than agroAnalysisKeys (the Analyseur Agronomique tab's independent one).
+  const resolveClimateKey = (roles: string[], fallbackTest: (k: string) => boolean): string | null => {
+    const tagged = selectedKeys.find(k => roles.includes(metricConfigs[k]?.agroRole));
+    if (tagged) return tagged;
+    const fallback = selectedKeys.find(k => {
+      const role = metricConfigs[k]?.agroRole;
+      return (!role || role === "none") && fallbackTest(k);
+    });
+    return fallback || null;
+  };
+
+  // "Efficience photosynthétique" sub-tab (Aréel / IVL) - formulas as given: PAR_int = R_ext ×
+  // translucidité × 2.2 ; A25 = 44 × (1 - e^(-0.0022 × PAR_int)) × ((CO2-90)/(CO2+320)), 0 si
+  // CO2 ≤ 90 ; F_T = 1 + (T-25) × (0.00014×CO2 - 0.092) ; Aréel = A25 × F_T (axe gauche,
+  // μmol CO2·m⁻²·s⁻¹) ; IVL(%) = 126.9 × ((CO2-90)/(CO2+320)) × F_T, borné [0,100] (axe droit).
+  // R_ext = radiation instantanée EXTÉRIEURE (W/m², même capteur que radKeys ailleurs dans ce
+  // fichier - repli vers "irr_out"/Priva météo) ; T = température serre (pas extérieure).
+  const co2Key = resolveClimateKey(["co2"], k => k.toLowerCase().includes("co2"));
+  const radKey = resolveClimateKey(["radiation_instantanee"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
+  const tempKey = resolveClimateKey(["temp_serre"], k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
+
+  const photosynthesisChartData = useMemo(() => {
+    if (!co2Key || !radKey || !tempKey) return [];
+    const translucidity = glassTranslucidityPercent !== "" && !isNaN(Number(glassTranslucidityPercent))
+      ? Number(glassTranslucidityPercent) / 100
+      : 0.70;
+
+    return chartData
+      .map((row: any) => {
+        const co2 = Number(row[co2Key]);
+        const rExt = Number(row[radKey]);
+        const temp = Number(row[tempKey]);
+        if (isNaN(co2) || isNaN(rExt) || isNaN(temp)) {
+          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: null, ivl: null };
+        }
+
+        if (co2 <= 90) {
+          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: 0, ivl: 0 };
+        }
+
+        const parInt = rExt * translucidity * 2.2;
+        const co2Ratio = (co2 - 90) / (co2 + 320);
+        const a25 = 44 * (1 - Math.exp(-0.0022 * parInt)) * co2Ratio;
+        const fT = 1 + (temp - 25) * (0.00014 * co2 - 0.092);
+        const aReel = Math.max(0, a25 * fT);
+        const ivl = Math.min(100, Math.max(0, 126.9 * co2Ratio * fT));
+
+        return {
+          time: row.time,
+          formattedTime: row.formattedTime,
+          formattedDate: row.formattedDate,
+          aReel: Number(aReel.toFixed(2)),
+          ivl: Number(ivl.toFixed(1))
+        };
+      })
+      .sort((a, b) => a.time - b.time);
+  }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent]);
+
   // Analyseur Agronomique keeps its own date range (agroRawDataMap, fetched separately below)
   // so browsing a different period there never changes what the Climat/Croissance chart shows.
   // The detected movements are captured into a ref here (via buildChartRows' out-param) so
@@ -4067,6 +4132,32 @@ export default function AranetUnifiedDashboard() {
               <div className="flex flex-1 flex-col overflow-hidden lg:h-[calc(100vh-3.5rem)]">
                 {/* Right Side: Charts Display Area (takes full width) */}
                 <main className="flex-1 p-4 md:p-6 overflow-y-auto flex flex-col gap-4 min-h-0 bg-muted/10">
+                  {/* Climat/Croissance sub-tabs: the existing sensor chart, or the new
+                      photosynthesis efficiency (Aréel/IVL) chart - both share the date range
+                      controls below. */}
+                  <div className="flex items-center bg-muted p-0.5 rounded-xl border shrink-0 w-fit">
+                    <button
+                      onClick={() => setClimatSubTab("data")}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                        climatSubTab === "data"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Graphique des données climatiques
+                    </button>
+                    <button
+                      onClick={() => setClimatSubTab("efficiency")}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                        climatSubTab === "efficiency"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Efficience photosynthétique
+                    </button>
+                  </div>
+
                   {/* Calendar & Title Row */}
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-background p-4 rounded-2xl border border-muted/20 shadow-sm shrink-0">
                     <div>
@@ -4116,6 +4207,8 @@ export default function AranetUnifiedDashboard() {
                     </div>
                   </div>
 
+                  {climatSubTab === "data" && (
+                  <>
                   {/* Sensor Visibility Toggles */}
                   {selectedKeys.length > 0 && (
                     <div className="flex flex-wrap items-center gap-2 bg-background p-3 rounded-2xl border border-muted/20 shadow-sm shrink-0 animate-in fade-in duration-300">
@@ -4432,7 +4525,115 @@ export default function AranetUnifiedDashboard() {
                     </Card>
 
                   </>
-                )}
+                  )}
+                  </>
+                  )}
+
+                  {climatSubTab === "efficiency" && (
+                    <>
+                      {(!co2Key || !radKey || !tempKey) ? (
+                        <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold flex items-center gap-3 shadow-sm">
+                          <AlertTriangle className="h-5 w-5 shrink-0 text-amber-500" />
+                          <div>
+                            Sélection requise : ce graphique a besoin de{" "}
+                            {[!co2Key && "CO2", !radKey && "Radiation instantanée (extérieure)", !tempKey && "Température serre"].filter(Boolean).join(", ")}{" "}
+                            coché(s) dans l&apos;onglet <i>Sélection des données</i> (rôle agronomique correspondant recommandé, ou nom de capteur reconnaissable).
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="bg-background border border-border p-4 rounded-2xl shadow-sm shrink-0">
+                            <h4 className="text-xs font-black uppercase text-foreground flex items-center gap-2">
+                              <Gauge className="h-4 w-4 text-primary" /> Efficience photosynthétique (Aréel / IVL)
+                            </h4>
+                            <p className="text-[10px] text-muted-foreground font-semibold mt-1 leading-relaxed">
+                              <b>Aréel</b> (axe gauche, μmol CO2·m⁻²·s⁻¹) est la vitesse de photosynthèse instantanée réelle, calculée à partir du CO2, de la radiation extérieure et de la température serre.{" "}
+                              <b>IVL</b> (axe droit, %) mesure la qualité du pilotage climatique (température + CO2) indépendamment de la lumière disponible à l&apos;instant T - un IVL bas signale un potentiel lumineux gaspillé par un climat mal réglé. Translucidité du verre utilisée : {glassTranslucidityPercent !== "" ? `${glassTranslucidityPercent}%` : "70% (valeur par défaut)"}.
+                            </p>
+                          </div>
+
+                          <Card className="flex-1 flex flex-col bg-background border border-muted/20 shadow-sm overflow-hidden min-h-[400px]">
+                            <CardHeader className="p-4 border-b bg-muted/5">
+                              <CardTitle className="text-xs font-black uppercase tracking-tight">Aréel et IVL dans le temps</CardTitle>
+                              <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Bandes de fond sur l&apos;axe IVL : rouge (&lt;70%, gaspillage lumineux), jaune (70-90%, frein modéré), vert (90-100%, valorisation excellente).</p>
+                            </CardHeader>
+                            <CardContent className="p-4 flex-1 flex flex-col min-h-0">
+                              <div className="w-full h-[420px]">
+                                <ResponsiveContainer width="100%" height="100%">
+                                  <LineChart data={photosynthesisChartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                                    <CartesianGrid yAxisId="left" strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+                                    <ReferenceArea yAxisId="right" y1={0} y2={70} fill="#ef4444" fillOpacity={0.08} strokeOpacity={0} />
+                                    <ReferenceArea yAxisId="right" y1={70} y2={90} fill="#f59e0b" fillOpacity={0.08} strokeOpacity={0} />
+                                    <ReferenceArea yAxisId="right" y1={90} y2={100} fill="#22c55e" fillOpacity={0.1} strokeOpacity={0} />
+                                    <XAxis
+                                      dataKey="time"
+                                      type="number"
+                                      scale="time"
+                                      domain={['auto', 'auto']}
+                                      tickFormatter={(ts) => {
+                                        const d = new Date(ts);
+                                        return d.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                      }}
+                                      tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
+                                      axisLine={false}
+                                      tickLine={false}
+                                      dy={5}
+                                    />
+                                    <YAxis
+                                      yAxisId="left"
+                                      orientation="left"
+                                      stroke="#0ea5e9"
+                                      tick={{ fontSize: 8, fill: "#0ea5e9" }}
+                                      width={36}
+                                      label={{ value: "Aréel (μmol CO2/m²/s)", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fill: "#0ea5e9", fontSize: 8, fontWeight: "bold" } }}
+                                    />
+                                    <YAxis
+                                      yAxisId="right"
+                                      orientation="right"
+                                      domain={[0, 100]}
+                                      stroke="#7c3aed"
+                                      tick={{ fontSize: 8, fill: "#7c3aed" }}
+                                      width={32}
+                                      unit="%"
+                                      label={{ value: "IVL (%)", angle: 90, position: "insideRight", style: { textAnchor: "middle", fill: "#7c3aed", fontSize: 8, fontWeight: "bold" } }}
+                                    />
+                                    <Tooltip content={({ active, payload, label }: any) => {
+                                      if (!active || !payload || !payload.length) return null;
+                                      const ivlPoint = payload.find((p: any) => p.dataKey === "ivl");
+                                      const ivlVal = ivlPoint?.value;
+                                      const diagnostic = ivlVal === null || ivlVal === undefined ? null
+                                        : ivlVal >= 90 ? { text: "Valorisation excellente", color: "text-emerald-500" }
+                                        : ivlVal >= 70 ? { text: "Frein modéré (CO2 à envisager)", color: "text-amber-500" }
+                                        : { text: "Gaspillage lumineux", color: "text-rose-500" };
+                                      const d = new Date(label);
+                                      return (
+                                        <div className="bg-background border border-muted-foreground/20 p-2.5 rounded-xl shadow-lg space-y-1 text-[11px] z-30">
+                                          <p className="font-bold text-foreground">{d.toLocaleDateString([], { day: '2-digit', month: '2-digit' })} {d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                                          {payload.map((item: any) => (
+                                            <p key={item.dataKey} style={{ color: item.color }} className="font-semibold">
+                                              {item.name} : {item.value !== null && item.value !== undefined ? item.value : "N/A"}{item.dataKey === "ivl" ? "%" : ""}
+                                            </p>
+                                          ))}
+                                          {diagnostic && (
+                                            <p className={`font-bold pt-1 border-t border-border/30 mt-1 ${diagnostic.color}`}>
+                                              {diagnostic.text}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    }} />
+                                    <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
+                                    <Line yAxisId="left" type="monotone" dataKey="aReel" name="Aréel" stroke="#0ea5e9" strokeWidth={1.6} dot={false} connectNulls={true} isAnimationActive={false} />
+                                    <Line yAxisId="right" type="monotone" dataKey="ivl" name="IVL" stroke="#7c3aed" strokeWidth={1.6} dot={false} connectNulls={true} isAnimationActive={false} />
+                                  </LineChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </CardContent>
+                          </Card>
+                        </>
+                      )}
+                    </>
+                  )}
                 </main>
               </div>
             ) : activeTab === "chutes" ? (
