@@ -14,7 +14,7 @@ export const ROLE_TO_CLIMATE_FIELD: { [role: string]: string } = {
   poids_pain: "slabWeightAvg",
   temp_pain: "substrateTempAvg",
   consommation_eau: "waterConsumptionAvg",
-  radiation_instantanee: "radAvg",
+  radiation_instant: "radAvg",
   vitesse_vent: "windAvg",
   co2: "co2Avg",
   pluie: "rainAvg"

@@ -2561,7 +2561,7 @@ export default function AranetUnifiedDashboard() {
   // R_ext = radiation instantanée EXTÉRIEURE (W/m², même capteur que radKeys ailleurs dans ce
   // fichier - repli vers "irr_out"/Priva météo) ; T = température serre (pas extérieure).
   const co2Key = resolveClimateKey(["co2"], k => k.toLowerCase().includes("co2"));
-  const radKey = resolveClimateKey(["radiation_instantanee"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
+  const radKey = resolveClimateKey(["radiation_instant"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
   const tempKey = resolveClimateKey(["temp_serre"], k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
 
   const photosynthesisChartData = useMemo(() => {
@@ -2790,7 +2790,7 @@ export default function AranetUnifiedDashboard() {
       const slabWeightKeys = keysByRoleAll(["poids_pain"], k => k.toLowerCase().includes("slab_weight"));
       const substrateTempKeys = keysByRoleAll(["temp_pain"], k => k.toLowerCase().includes("ec_wc_1") && !k.toLowerCase().includes("ec_wc_10") && !k.toLowerCase().includes("ec_wc_11"));
       const waterConsumptionKeys = keysByRoleAll(["consommation_eau"], () => false);
-      const radKeys = keysByRole(["radiation_instantanee"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
+      const radKeys = keysByRole(["radiation_instant"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
       const windKeys = keysByRole(["vitesse_vent"], k => k.toLowerCase().includes("wind"));
       const co2Keys = keysByRole(["co2"], k => k.toLowerCase().includes("co2"));
       const grosTuyauKeys = keysByRole(["gros_tuyau"], () => false);
@@ -3267,7 +3267,7 @@ export default function AranetUnifiedDashboard() {
         { field: "hr_serre", key: rhKeys[0] },
         { field: "humidite_pain", key: wcKeys[0] },
         { field: "ec_pain", key: ecKeys[0] },
-        { field: "radiation_instantanee", key: radKeys[0] },
+        { field: "radiation_instant", key: radKeys[0] },
         { field: "vitesse_vent", key: windKeys[0] },
         { field: "co2", key: co2Keys[0] },
         { field: "pluie", key: rainKeys[0] }
@@ -3331,7 +3331,7 @@ export default function AranetUnifiedDashboard() {
           hr_serre: rhAvg,
           humidite_pain: wcAvg,
           ec_pain: ecAvg,
-          radiation_instantanee: radAvg,
+          radiation_instant: radAvg,
           vitesse_vent: windAvg,
           co2: co2Avg,
           pluie: rainAvg,

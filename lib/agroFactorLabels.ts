@@ -20,7 +20,7 @@ export const AGRO_FACTOR_LABELS: { [factorKey: string]: string } = {
   hr_exterieure: "HR extérieure",
   humidite_pain: "Humidité du pain",
   ec_pain: "EC pain",
-  radiation_instantanee: "Radiation instantanée",
+  radiation_instant: "Radiation instantanée",
   vitesse_vent: "Vitesse du vent",
   co2: "CO2",
   pluie: "Pluie",
