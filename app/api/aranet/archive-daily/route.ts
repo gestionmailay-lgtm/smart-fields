@@ -70,14 +70,14 @@ async function getPrivaToken(): Promise<string> {
 // night for every compartiment, not only whichever points a user happened to select in the
 // dashboard (see the plan: "toutes les données ... pour l'ensemble des compartiments").
 const PRIVA_BUILTIN_CATALOG: { metric_key: string; variable_id: string; device_id: string; device_group_id: string | null }[] = [
-  { metric_key: "priva_temp_out", variable_id: "00000214-0001-0000-0000-0000000042a9", device_id: "VP9508", device_group_id: null },
-  { metric_key: "priva_hum_out", variable_id: "00000214-0001-0000-0000-00000000427e", device_id: "VP9508", device_group_id: null },
-  { metric_key: "priva_irr_out", variable_id: "00000214-0001-0000-0000-0000000042fd", device_id: "VP9508", device_group_id: null },
-  { metric_key: "priva_wind_out", variable_id: "00000214-0001-0000-0000-0000000042ad", device_id: "VP9508", device_group_id: null },
+  { metric_key: "priva_temp_out", variable_id: "00000214-0001-0000-0000-0000000042a9", device_id: "VP9508", device_group_id: "none" },
+  { metric_key: "priva_hum_out", variable_id: "00000214-0001-0000-0000-00000000427e", device_id: "VP9508", device_group_id: "none" },
+  { metric_key: "priva_irr_out", variable_id: "00000214-0001-0000-0000-0000000042fd", device_id: "VP9508", device_group_id: "none" },
+  { metric_key: "priva_wind_out", variable_id: "00000214-0001-0000-0000-0000000042ad", device_id: "VP9508", device_group_id: "none" },
   ...[1, 2, 3, 4, 5, 6].flatMap(c => [
-    { metric_key: `priva_c${c}_temp`, variable_id: `0000002c-0001-000${c}-0000-0000000006f6`, device_id: "VP9508", device_group_id: null },
-    { metric_key: `priva_c${c}_temp_target`, variable_id: `0000002c-0001-000${c}-0000-0000000006e5`, device_id: "VP9508", device_group_id: null },
-    { metric_key: `priva_c${c}_hum`, variable_id: `000002bb-000${c}-0000-0000-0000000050f2`, device_id: "VP9508", device_group_id: null }
+    { metric_key: `priva_c${c}_temp`, variable_id: `0000002c-0001-000${c}-0000-0000000006f6`, device_id: "VP9508", device_group_id: "none" },
+    { metric_key: `priva_c${c}_temp_target`, variable_id: `0000002c-0001-000${c}-0000-0000000006e5`, device_id: "VP9508", device_group_id: "none" },
+    { metric_key: `priva_c${c}_hum`, variable_id: `000002bb-000${c}-0000-0000-0000000050f2`, device_id: "VP9508", device_group_id: "none" }
   ])
 ];
 
@@ -117,7 +117,10 @@ async function archivePrivaForDay(
       datapoints: points.map(p => ({ variableId: p.variable_id, deviceId: p.device_id, deviceGroupId: p.device_group_id || undefined }))
     })
   });
-  if (!res.ok) throw new Error(`Priva API ${res.status}`);
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => "");
+    throw new Error(`Priva API ${res.status}${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`);
+  }
   const data = await res.json();
   const series: any[] = data.data || [];
 
