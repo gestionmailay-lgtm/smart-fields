@@ -964,6 +964,20 @@ export default function AranetUnifiedDashboard() {
     agroRoles.forEach(r => { map[r.role_key] = r.label; });
     return map;
   }, [agroRoles]);
+  // role_key -> category, used to group "Sélection des données" by agronomic role category
+  // instead of by sensor catalog category (Priva compartment, Aranet category, etc.) - see
+  // renderGroupedMetrics below. Also used to exempt "Météo extérieure"-tagged sensors from the
+  // Compartiment filter, since exterior weather is shared across every compartment.
+  const agroRoleCategoryByKey = useMemo(() => {
+    const map: { [roleKey: string]: string } = {};
+    agroRoles.forEach(r => { map[r.role_key] = r.category; });
+    return map;
+  }, [agroRoles]);
+  // Category label used by the admin role catalog (app/dashboard/aranet/roles) for exterior
+  // weather roles (temp_ext, hr_ext, wind_speed/direction, rain, radiation_instant/sum) - these
+  // describe conditions outside the greenhouse, identical for every compartiment, so a sensor
+  // tagged with one of them should never be hidden by the Compartiment filter.
+  const EXTERIOR_WEATHER_ROLE_CATEGORY = "Météo extérieure";
 
   const fetchAgroRoles = async () => {
     try {
@@ -3711,8 +3725,17 @@ export default function AranetUnifiedDashboard() {
   // Group metrics by visibility (filtered by active compartment). "Visible" now means selected
   // for EITHER graph (Climat/Croissance or Ferti Irrigation) - a sensor only ticked FERTI must
   // still show up on the left, not get stranded on the right as if nothing had been chosen.
+  // A sensor tagged with a "Météo extérieure" role (temp_ext, hr_ext, wind_speed/direction,
+  // rain, radiation_instant/sum) describes conditions outside the greenhouse - identical for
+  // every compartiment - so it must never be hidden by the Compartiment filter below.
+  const isExteriorWeatherSensor = (m: any) => {
+    const role = metricConfigsDraft[m.key]?.agroRole;
+    return !!role && role !== "none" && agroRoleCategoryByKey[role] === EXTERIOR_WEATHER_ROLE_CATEGORY;
+  };
+
   const visibleMetrics = allMetrics.filter(m => {
     if (!selectedKeysDraft.includes(m.key) && !fertiSelectedKeysDraft.includes(m.key)) return false;
+    if (isExteriorWeatherSensor(m)) return true;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -3726,6 +3749,7 @@ export default function AranetUnifiedDashboard() {
 
   const hiddenMetrics = allMetrics.filter(m => {
     if (selectedKeysDraft.includes(m.key) || fertiSelectedKeysDraft.includes(m.key)) return false;
+    if (isExteriorWeatherSensor(m)) return true;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -3922,11 +3946,17 @@ export default function AranetUnifiedDashboard() {
     );
   };
 
-  // Helper to render grouped metrics in categories
+  // Helper to render grouped metrics in categories. Grouped by agronomic ROLE category
+  // (agro_roles.category, e.g. "Météo extérieure", "Climat / Croissance", "Ferti Irrigation")
+  // when the sensor is tagged, so the list reflects what each sensor actually means agronomically
+  // rather than which physical Priva compartment/Aranet catalog section it happens to come from.
+  // Untagged sensors fall back to their sensor catalog category, same as before.
   const renderGroupedMetrics = (metricsList: any[]) => {
     const grouped: Record<string, any[]> = {};
     metricsList.forEach(m => {
-      const cat = m.category || "Autres";
+      const role = metricConfigsDraft[m.key]?.agroRole;
+      const roleCategory = role && role !== "none" ? agroRoleCategoryByKey[role] : null;
+      const cat = roleCategory || m.category || "Autres";
       if (!grouped[cat]) grouped[cat] = [];
       grouped[cat].push(m);
     });
