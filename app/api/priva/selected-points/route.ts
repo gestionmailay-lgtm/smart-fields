@@ -24,15 +24,22 @@ export async function POST(req: NextRequest) {
 
     const supabase = createAdminClient();
 
+    // Same protection as app/api/aranet/metric-roles/route.ts: an empty payload almost always
+    // means the sending browser/session hadn't loaded its Priva selection yet (fresh browser,
+    // cleared cache, private window), not that the user genuinely cleared every Priva point -
+    // and priva_selected_points was in fact found wiped in production. Treat empty as a no-op
+    // instead of blindly deleting everything.
+    if (rows.length === 0) {
+      return NextResponse.json({ success: true, count: 0, skipped: true });
+    }
+
     // Replace the full set (delete-then-insert), same pattern as
     // app/api/aranet/selected-sensors/route.ts and app/api/aranet/metric-roles/route.ts.
     const { error: deleteError } = await supabase.from("priva_selected_points").delete().neq("metric_key", "");
     if (deleteError) throw deleteError;
 
-    if (rows.length > 0) {
-      const { error: insertError } = await supabase.from("priva_selected_points").insert(rows);
-      if (insertError) throw insertError;
-    }
+    const { error: insertError } = await supabase.from("priva_selected_points").insert(rows);
+    if (insertError) throw insertError;
 
     return NextResponse.json({ success: true, count: rows.length });
   } catch (error: any) {

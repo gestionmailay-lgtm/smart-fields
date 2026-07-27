@@ -18,16 +18,26 @@ export async function POST(req: NextRequest) {
 
     const supabase = createAdminClient();
 
+    // An empty payload here almost never means "the user untagged every single sensor" - far
+    // more likely it means metricConfigs hadn't loaded yet in whatever browser/session sent it
+    // (fresh browser, cleared cache, private window with no localStorage). A blind
+    // delete-then-insert would wipe every previously saved role tag in that case - which is
+    // exactly what happened once already (aranet_metric_roles found empty in production despite
+    // roles having been configured). So an empty roles[] is now a no-op: nothing is deleted,
+    // nothing is inserted. Removing a role tag one at a time still works fine, since that only
+    // shrinks the array - it doesn't require going through empty.
+    if (rows.length === 0) {
+      return NextResponse.json({ success: true, count: 0, skipped: true });
+    }
+
     // Replace the full set (delete-then-insert), same pattern as
     // app/api/aranet/selected-sensors/route.ts - keeps stale tags from lingering after a sensor
     // is retagged or reset to "Aucun (Auto)".
     const { error: deleteError } = await supabase.from("aranet_metric_roles").delete().neq("metric_key", "");
     if (deleteError) throw deleteError;
 
-    if (rows.length > 0) {
-      const { error: insertError } = await supabase.from("aranet_metric_roles").insert(rows);
-      if (insertError) throw insertError;
-    }
+    const { error: insertError } = await supabase.from("aranet_metric_roles").insert(rows);
+    if (insertError) throw insertError;
 
     return NextResponse.json({ success: true, count: rows.length });
   } catch (error: any) {

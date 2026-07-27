@@ -16,6 +16,14 @@ export async function POST(req: NextRequest) {
 
     const supabase = createAdminClient();
 
+    // Same protection as app/api/aranet/metric-roles/route.ts and
+    // app/api/priva/selected-points/route.ts: an empty metricKeys[] almost always means the
+    // sending browser/session hadn't loaded its selection yet, not that the user genuinely
+    // deselected every sensor for this scope - treat it as a no-op instead of wiping the scope.
+    if (metricKeys.length === 0) {
+      return NextResponse.json({ success: true, skipped: true });
+    }
+
     // Replace this scope's full selection (delete-then-insert keeps it simple and avoids
     // stale sensors lingering after the user deselects them).
     const { error: deleteError } = await supabase
@@ -24,11 +32,9 @@ export async function POST(req: NextRequest) {
       .eq("scope", scope);
     if (deleteError) throw deleteError;
 
-    if (metricKeys.length > 0) {
-      const rows = metricKeys.map((metric_key: string) => ({ scope, metric_key, updated_at: new Date().toISOString() }));
-      const { error: insertError } = await supabase.from("aranet_selected_sensors").insert(rows);
-      if (insertError) throw insertError;
-    }
+    const rows = metricKeys.map((metric_key: string) => ({ scope, metric_key, updated_at: new Date().toISOString() }));
+    const { error: insertError } = await supabase.from("aranet_selected_sensors").insert(rows);
+    if (insertError) throw insertError;
 
     return NextResponse.json({ success: true });
   } catch (error: any) {
