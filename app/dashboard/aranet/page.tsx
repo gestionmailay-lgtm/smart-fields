@@ -2667,6 +2667,29 @@ export default function AranetUnifiedDashboard() {
       .sort((a, b) => a.time - b.time);
   }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
 
+  // Optional Savitzky-Golay smoothing on "Croissance en direct" specifically - the raw rolling
+  // rate is already 15-minute-windowed but still jumpy point to point, and unlike a real sensor
+  // this synthetic series has no metricConfigs entry of its own, so its own small
+  // enable/window-size state lives here rather than piggybacking on updateMetricConfig.
+  const [growthRateSmooth, setGrowthRateSmooth] = useState(false);
+  const [growthRateSgWindow, setGrowthRateSgWindow] = useState(9);
+  const smoothedPhotosynthesisChartData = useMemo(() => {
+    if (!growthRateSmooth) return photosynthesisChartData;
+    // Same "filter nulls, smooth the contiguous run, map back by time" pattern used for real
+    // sensors in buildChartRows - a Savitzky-Golay window can't cross over a gap meaningfully.
+    const withValue = photosynthesisChartData.filter((r: any) => r.growthRatePercent !== null && r.growthRatePercent !== undefined);
+    if (withValue.length === 0) return photosynthesisChartData;
+    let windowSize = growthRateSgWindow;
+    if (windowSize % 2 === 0) windowSize += 1;
+    const smoothedValues = applySavitzkyGolay(withValue.map((r: any) => r.growthRatePercent), windowSize, 2);
+    const smoothedByTime = new Map<number, number>();
+    withValue.forEach((r: any, idx: number) => smoothedByTime.set(r.time, Number(smoothedValues[idx].toFixed(1))));
+    return photosynthesisChartData.map((r: any) => ({
+      ...r,
+      growthRatePercent: smoothedByTime.has(r.time) ? smoothedByTime.get(r.time) : r.growthRatePercent
+    }));
+  }, [photosynthesisChartData, growthRateSmooth, growthRateSgWindow]);
+
   // Analyseur Agronomique keeps its own date range (agroRawDataMap, fetched separately below)
   // so browsing a different period there never changes what the Climat/Croissance chart shows.
   // The detected movements are captured into a ref here (via buildChartRows' out-param) so
@@ -4636,14 +4659,40 @@ export default function AranetUnifiedDashboard() {
                           </div>
 
                           <Card className="flex-1 flex flex-col bg-background border border-muted/20 shadow-sm overflow-hidden min-h-[400px]">
-                            <CardHeader className="p-4 border-b bg-muted/5">
-                              <CardTitle className="text-xs font-black uppercase tracking-tight">Aréel, IVL et Croissance en direct dans le temps</CardTitle>
-                              <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Bandes de fond sur l&apos;axe IVL : rouge (&lt;70%, gaspillage lumineux), jaune (70-90%, frein modéré), vert (90-100%, valorisation excellente). Ligne pointillée à 0% : rythme de croissance moyen de la journée.</p>
+                            <CardHeader className="p-4 border-b bg-muted/5 flex flex-row items-start justify-between gap-3 flex-wrap">
+                              <div>
+                                <CardTitle className="text-xs font-black uppercase tracking-tight">Aréel, IVL et Croissance en direct dans le temps</CardTitle>
+                                <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Bandes de fond sur l&apos;axe IVL : rouge (&lt;70%, gaspillage lumineux), jaune (70-90%, frein modéré), vert (90-100%, valorisation excellente). Ligne pointillée à 0% : rythme de croissance moyen de la journée.</p>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <label className="flex items-center gap-1.5 cursor-pointer text-[9px] font-bold text-muted-foreground">
+                                  <input
+                                    type="checkbox"
+                                    checked={growthRateSmooth}
+                                    onChange={(e) => setGrowthRateSmooth(e.target.checked)}
+                                    className="rounded border-muted text-primary focus:ring-primary h-3 w-3 cursor-pointer"
+                                  />
+                                  Lissage SG (Croissance en direct)
+                                </label>
+                                {growthRateSmooth && (
+                                  <select
+                                    value={growthRateSgWindow}
+                                    onChange={(e) => setGrowthRateSgWindow(Number(e.target.value))}
+                                    className="text-[9px] border rounded bg-background px-1 focus:outline-none focus:ring-1 focus:ring-primary h-5 cursor-pointer"
+                                  >
+                                    <option value="5">5 pts</option>
+                                    <option value="9">9 pts</option>
+                                    <option value="15">15 pts</option>
+                                    <option value="25">25 pts</option>
+                                    <option value="45">45 pts</option>
+                                  </select>
+                                )}
+                              </div>
                             </CardHeader>
                             <CardContent className="p-4 flex-1 flex flex-col min-h-0">
                               <div className="w-full h-[420px]">
                                 <ResponsiveContainer width="100%" height="100%">
-                                  <LineChart data={photosynthesisChartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                                  <LineChart data={smoothedPhotosynthesisChartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
                                     <CartesianGrid yAxisId="left" strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
                                     <ReferenceArea yAxisId="right" y1={0} y2={70} fill="#ef4444" fillOpacity={0.08} strokeOpacity={0} />
                                     <ReferenceArea yAxisId="right" y1={70} y2={90} fill="#f59e0b" fillOpacity={0.08} strokeOpacity={0} />
