@@ -2578,6 +2578,55 @@ export default function AranetUnifiedDashboard() {
   const radKey = resolveClimateKey(["radiation_instant"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
   const tempKey = resolveClimateKey(["temp_serre"], k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
 
+  // "Croissance en direct" - a rolling 15-minute gain rate expressed as a % deviation from that
+  // calendar day's own average rate, so the curve reads growth speed right now rather than an
+  // absolute, hard-to-interpret g/m² figure. 0% = exactly the day's average pace (e.g. 96 g/m²
+  // over a day = 1 g/15min average, so any 15-minute window gaining exactly 1g sits at 0%);
+  // +100% = growing at twice the day's average pace; -100% = no growth at all over that window
+  // (clamped, since growth can't meaningfully go "more negative" than flat for this reading).
+  // Keyed by row.time so it can be merged into photosynthesisChartData below without a second
+  // pass over chartData.
+  const growthRateByTime = useMemo(() => {
+    const result = new Map<number, number | null>();
+    const gainRows = chartData
+      .filter((r: any) => r.plant_weight_gain !== undefined && r.plant_weight_gain !== null && !isNaN(Number(r.plant_weight_gain)))
+      .map((r: any) => ({ time: r.time, value: Number(r.plant_weight_gain) }))
+      .sort((a, b) => a.time - b.time);
+    if (gainRows.length === 0) return result;
+
+    const byDay = new Map<string, { time: number; value: number }[]>();
+    gainRows.forEach(r => {
+      const dateStr = getStableDateStr(new Date(r.time));
+      if (!byDay.has(dateStr)) byDay.set(dateStr, []);
+      byDay.get(dateStr)!.push(r);
+    });
+    // 96 = number of 15-minute slices in 24h - the day's average rate is its own total gain
+    // (last reading minus first, in g/m²) spread evenly over those slices.
+    const dailyAvgRateByDay = new Map<string, number | null>();
+    byDay.forEach((rows, dateStr) => {
+      if (rows.length < 2) { dailyAvgRateByDay.set(dateStr, null); return; }
+      const totalGainG = (rows[rows.length - 1].value - rows[0].value) * 1000;
+      dailyAvgRateByDay.set(dateStr, totalGainG / 96);
+    });
+
+    const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+    let lookbackIdx = 0;
+    gainRows.forEach((r, idx) => {
+      const dailyAvg = dailyAvgRateByDay.get(getStableDateStr(new Date(r.time)));
+      if (!dailyAvg) { result.set(r.time, null); return; }
+
+      const targetTime = r.time - FIFTEEN_MIN_MS;
+      if (lookbackIdx > idx) lookbackIdx = 0;
+      while (lookbackIdx < idx && gainRows[lookbackIdx + 1].time <= targetTime) lookbackIdx++;
+      if (gainRows[lookbackIdx].time > targetTime) { result.set(r.time, null); return; }
+
+      const rollingGainG = (r.value - gainRows[lookbackIdx].value) * 1000;
+      const pct = Math.min(100, Math.max(-100, ((rollingGainG - dailyAvg) / dailyAvg) * 100));
+      result.set(r.time, Number(pct.toFixed(1)));
+    });
+    return result;
+  }, [chartData]);
+
   const photosynthesisChartData = useMemo(() => {
     if (!co2Key || !radKey || !tempKey) return [];
     const translucidity = glassTranslucidityPercent !== "" && !isNaN(Number(glassTranslucidityPercent))
@@ -2589,12 +2638,14 @@ export default function AranetUnifiedDashboard() {
         const co2 = Number(row[co2Key]);
         const rExt = Number(row[radKey]);
         const temp = Number(row[tempKey]);
+        const growthRatePercent = growthRateByTime.get(row.time) ?? null;
+
         if (isNaN(co2) || isNaN(rExt) || isNaN(temp)) {
-          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: null, ivl: null };
+          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: null, ivl: null, growthRatePercent };
         }
 
         if (co2 <= 90) {
-          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: 0, ivl: 0 };
+          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: 0, ivl: 0, growthRatePercent };
         }
 
         const parInt = rExt * translucidity * 2.2;
@@ -2609,11 +2660,12 @@ export default function AranetUnifiedDashboard() {
           formattedTime: row.formattedTime,
           formattedDate: row.formattedDate,
           aReel: Number(aReel.toFixed(2)),
-          ivl: Number(ivl.toFixed(1))
+          ivl: Number(ivl.toFixed(1)),
+          growthRatePercent
         };
       })
       .sort((a, b) => a.time - b.time);
-  }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent]);
+  }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
 
   // Analyseur Agronomique keeps its own date range (agroRawDataMap, fetched separately below)
   // so browsing a different period there never changes what the Climat/Croissance chart shows.
@@ -4578,14 +4630,15 @@ export default function AranetUnifiedDashboard() {
                             </h4>
                             <p className="text-[10px] text-muted-foreground font-semibold mt-1 leading-relaxed">
                               <b>Aréel</b> (axe gauche, μmol CO2·m⁻²·s⁻¹) est la vitesse de photosynthèse instantanée réelle, calculée à partir du CO2, de la radiation extérieure et de la température serre.{" "}
-                              <b>IVL</b> (axe droit, %) mesure la qualité du pilotage climatique (température + CO2) indépendamment de la lumière disponible à l&apos;instant T - un IVL bas signale un potentiel lumineux gaspillé par un climat mal réglé. Translucidité du verre utilisée : {glassTranslucidityPercent !== "" ? `${glassTranslucidityPercent}%` : "70% (valeur par défaut)"}.
+                              <b>IVL</b> (axe droit, %) mesure la qualité du pilotage climatique (température + CO2) indépendamment de la lumière disponible à l&apos;instant T - un IVL bas signale un potentiel lumineux gaspillé par un climat mal réglé.{" "}
+                              <b>Croissance en direct</b> (axe droit extérieur, -100% à +100%) lisse le gain cumulé sur une fenêtre glissante de 15 minutes et l&apos;exprime en écart par rapport au rythme moyen de la journée (0% = rythme moyen du jour, +100% = deux fois plus vite que la moyenne, -100% = croissance à l&apos;arrêt sur cette fenêtre). Translucidité du verre utilisée : {glassTranslucidityPercent !== "" ? `${glassTranslucidityPercent}%` : "70% (valeur par défaut)"}.
                             </p>
                           </div>
 
                           <Card className="flex-1 flex flex-col bg-background border border-muted/20 shadow-sm overflow-hidden min-h-[400px]">
                             <CardHeader className="p-4 border-b bg-muted/5">
-                              <CardTitle className="text-xs font-black uppercase tracking-tight">Aréel et IVL dans le temps</CardTitle>
-                              <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Bandes de fond sur l&apos;axe IVL : rouge (&lt;70%, gaspillage lumineux), jaune (70-90%, frein modéré), vert (90-100%, valorisation excellente).</p>
+                              <CardTitle className="text-xs font-black uppercase tracking-tight">Aréel, IVL et Croissance en direct dans le temps</CardTitle>
+                              <p className="text-[9px] text-muted-foreground font-medium mt-0.5">Bandes de fond sur l&apos;axe IVL : rouge (&lt;70%, gaspillage lumineux), jaune (70-90%, frein modéré), vert (90-100%, valorisation excellente). Ligne pointillée à 0% : rythme de croissance moyen de la journée.</p>
                             </CardHeader>
                             <CardContent className="p-4 flex-1 flex flex-col min-h-0">
                               <div className="w-full h-[420px]">
@@ -4627,6 +4680,17 @@ export default function AranetUnifiedDashboard() {
                                       unit="%"
                                       label={{ value: "IVL (%)", angle: 90, position: "insideRight", style: { textAnchor: "middle", fill: "#7c3aed", fontSize: 8, fontWeight: "bold" } }}
                                     />
+                                    <YAxis
+                                      yAxisId="growth"
+                                      orientation="right"
+                                      domain={[-100, 100]}
+                                      stroke="#16a34a"
+                                      tick={{ fontSize: 8, fill: "#16a34a" }}
+                                      width={40}
+                                      unit="%"
+                                      label={{ value: "Croissance en direct (%)", angle: 90, position: "insideRight", style: { textAnchor: "middle", fill: "#16a34a", fontSize: 8, fontWeight: "bold" } }}
+                                    />
+                                    <ReferenceLine yAxisId="growth" y={0} stroke="#16a34a" strokeDasharray="4 3" strokeOpacity={0.6} />
                                     <Tooltip content={({ active, payload, label }: any) => {
                                       if (!active || !payload || !payload.length) return null;
                                       const ivlPoint = payload.find((p: any) => p.dataKey === "ivl");
@@ -4641,7 +4705,7 @@ export default function AranetUnifiedDashboard() {
                                           <p className="font-bold text-foreground">{d.toLocaleDateString([], { day: '2-digit', month: '2-digit' })} {d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
                                           {payload.map((item: any) => (
                                             <p key={item.dataKey} style={{ color: item.color }} className="font-semibold">
-                                              {item.name} : {item.value !== null && item.value !== undefined ? item.value : "N/A"}{item.dataKey === "ivl" ? "%" : ""}
+                                              {item.name} : {item.value !== null && item.value !== undefined ? item.value : "N/A"}{item.dataKey === "ivl" || item.dataKey === "growthRatePercent" ? "%" : ""}
                                             </p>
                                           ))}
                                           {diagnostic && (
@@ -4655,6 +4719,7 @@ export default function AranetUnifiedDashboard() {
                                     <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
                                     <Line yAxisId="left" type="monotone" dataKey="aReel" name="Aréel" stroke="#0ea5e9" strokeWidth={1.6} dot={false} connectNulls={true} isAnimationActive={false} />
                                     <Line yAxisId="right" type="monotone" dataKey="ivl" name="IVL" stroke="#7c3aed" strokeWidth={1.6} dot={false} connectNulls={true} isAnimationActive={false} />
+                                    <Line yAxisId="growth" type="monotone" dataKey="growthRatePercent" name="Croissance en direct" stroke="#16a34a" strokeWidth={1.6} dot={false} connectNulls={true} isAnimationActive={false} />
                                   </LineChart>
                                 </ResponsiveContainer>
                               </div>
