@@ -36,6 +36,9 @@ export async function POST(req: NextRequest) {
         climate: d.climate ?? {},
         drops: d.drops ?? [],
         rule_based_findings: d.ruleBasedFindings ?? [],
+        culture: d.culture ?? null,
+        culture_typology: d.cultureTypology ?? null,
+        glass_translucidity_percent: d.glassTranslucidityPercent ?? null,
         updated_at: new Date().toISOString()
       }));
 

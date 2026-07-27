@@ -34,7 +34,8 @@ import {
   Lightbulb,
   ShieldAlert,
   Droplets,
-  Tag
+  Tag,
+  Leaf
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { 
@@ -51,6 +52,22 @@ import {
 } from "recharts";
 
 // Definition of all 20 plottable metrics with their available units
+// "Paramètres Techniques de la Serre" card (Sélection des données) - typologies depend on the
+// selected culture. Only Tomate has a known list so far; Concombre's dropdown stays empty until
+// one is provided.
+const CULTURE_OPTIONS = ["Tomate", "Concombre"];
+const CULTURE_TYPOLOGIES: { [culture: string]: string[] } = {
+  Tomate: [
+    "Tomate cerise ronde",
+    "Tomate cerise allongée",
+    "Tomate ancienne",
+    "Tomate allongée",
+    "Tomate ronde en grappe/vrac",
+    "Tomate beef"
+  ],
+  Concombre: []
+};
+
 const PLOTTABLE_METRICS = [
   { key: "temp_rh_top_1", name: "T/RH top - Temp", category: "Climat", metricId: "1", color: "#e11d48", sensorId: "1071787", units: [{ id: "1", name: "°C" }, { id: "101", name: "°F" }, { id: "102", name: "K" }, { id: "119", name: "Cel" }] },
   { key: "temp_rh_top_2", name: "T/RH top - Humidity", category: "Climat", metricId: "2", color: "#06b6d4", sensorId: "1071787", units: [{ id: "2", name: "%" }, { id: "120", name: "%RH" }] },
@@ -1108,12 +1125,9 @@ export default function AranetUnifiedDashboard() {
 
   const alignMode = "absolute";
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [yLeftMin, setYLeftMin] = useState<string>("");
-  const [yLeftMax, setYLeftMax] = useState<string>("");
-  const [yRightMin, setYRightMin] = useState<string>("");
-  const [yRightMax, setYRightMax] = useState<string>("");
-  // Same left/right Y-axis override system as Climat/Croissance, but its own values since the
-  // Ferti Irrigation chart plots a different set of sensors over a different date range.
+  // Manual left/right Y-axis override for the Ferti Irrigation chart specifically (its own
+  // sensors/date range - Climat/Croissance no longer has this, replaced by "Paramètres
+  // Techniques de la Serre" in Sélection des données).
   const [yLeftMinFerti, setYLeftMinFerti] = useState<string>("");
   const [yLeftMaxFerti, setYLeftMaxFerti] = useState<string>("");
   const [yRightMinFerti, setYRightMinFerti] = useState<string>("");
@@ -1143,6 +1157,37 @@ export default function AranetUnifiedDashboard() {
       setDensityPerM2(Math.max(0.1, Number(value) || 0.1));
     }, 500);
   };
+
+  // Greenhouse-wide technical parameters ("Paramètres Techniques de la Serre" card in Sélection
+  // des données) - unlike plantsOnScale/densityPerM2 above, these are also read by the
+  // unattended nightly cron (app/api/aranet/archive-daily/route.ts), so greenhouse_settings in
+  // Supabase is their source of truth, not localStorage; loaded once on mount and PATCHed
+  // (debounced) on every change via /api/greenhouse-settings.
+  const [greenhouseCulture, setGreenhouseCulture] = useState<string>("");
+  const [greenhouseCultureTypology, setGreenhouseCultureTypology] = useState<string>("");
+  const [glassTranslucidityPercent, setGlassTranslucidityPercent] = useState<string>("");
+  const greenhouseSettingsCommitTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const commitGreenhouseSettings = (update: { culture?: string; cultureTypology?: string; glassTranslucidityPercent?: string }) => {
+    if (greenhouseSettingsCommitTimeoutRef.current) clearTimeout(greenhouseSettingsCommitTimeoutRef.current);
+    greenhouseSettingsCommitTimeoutRef.current = setTimeout(() => {
+      fetch("/api/greenhouse-settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update)
+      }).catch(e => console.error("Failed to save greenhouse settings:", e));
+    }, 500);
+  };
+  useEffect(() => {
+    fetch("/api/greenhouse-settings")
+      .then(res => res.json())
+      .then(data => {
+        if (!data?.settings) return;
+        setGreenhouseCulture(data.settings.culture || "");
+        setGreenhouseCultureTypology(data.settings.culture_typology || "");
+        setGlassTranslucidityPercent(data.settings.glass_translucidity_percent !== null && data.settings.glass_translucidity_percent !== undefined ? String(data.settings.glass_translucidity_percent) : "");
+      })
+      .catch(e => console.error("Failed to load greenhouse settings:", e));
+  }, []);
 
   // AI black-box agronomic explanation, keyed per day so each analyzed day keeps its result
   // cached instead of re-calling the model every time the audit detail is revisited.
@@ -3191,7 +3236,10 @@ export default function AranetUnifiedDashboard() {
           growthEfficiency: d.growthEfficiency,
           climate: d.aiContext,
           drops: (d.drops || []).map((drop: WeightDropCandidate) => ({ time: drop.timeStr, valGm2: drop.suddenDropVal })),
-          ruleBasedFindings: d.aiContext?.ruleBasedFindings || []
+          ruleBasedFindings: d.aiContext?.ruleBasedFindings || [],
+          culture: greenhouseCulture || null,
+          cultureTypology: greenhouseCultureTypology || null,
+          glassTranslucidityPercent: glassTranslucidityPercent !== "" ? Number(glassTranslucidityPercent) : null
         }));
       if (days.length === 0) return;
       fetch("/api/agro-daily-summary", {
@@ -3203,7 +3251,7 @@ export default function AranetUnifiedDashboard() {
     return () => {
       if (agroSummarySyncTimeoutRef.current) clearTimeout(agroSummarySyncTimeoutRef.current);
     };
-  }, [agronomicDataWithBenchmark, isLoaded]);
+  }, [agronomicDataWithBenchmark, isLoaded, greenhouseCulture, greenhouseCultureTypology, glassTranslucidityPercent]);
 
   const brushIndices = useMemo(() => {
     if (!zoomTimeRange || chartData.length === 0) {
@@ -4022,17 +4070,6 @@ export default function AranetUnifiedDashboard() {
                                   {activeYAxes.map((yAxis) => {
                                     const isShared = yAxis.keys.length > 1;
                                     const axisColor = isShared ? "#64748b" : yAxis.color;
-                                    
-                                    const parsedLeftMin = Number(yLeftMin);
-                                    const parsedLeftMax = Number(yLeftMax);
-                                    const parsedRightMin = Number(yRightMin);
-                                    const parsedRightMax = Number(yRightMax);
-                                    const domainMin = yAxis.axis === "left"
-                                      ? (yLeftMin !== "" && !isNaN(parsedLeftMin) ? parsedLeftMin : "auto")
-                                      : (yRightMin !== "" && !isNaN(parsedRightMin) ? parsedRightMin : "auto");
-                                    const domainMax = yAxis.axis === "left"
-                                      ? (yLeftMax !== "" && !isNaN(parsedLeftMax) ? parsedLeftMax : "auto")
-                                      : (yRightMax !== "" && !isNaN(parsedRightMax) ? parsedRightMax : "auto");
 
                                     return (
                                       <YAxis
@@ -4041,7 +4078,7 @@ export default function AranetUnifiedDashboard() {
                                         orientation={yAxis.axis}
                                         stroke={axisColor}
                                         tick={{ fontSize: 8, fill: axisColor }}
-                                        domain={[domainMin, domainMax]}
+                                        domain={["auto", "auto"]}
                                         width={24}
                                         label={{
                                           value: yAxis.unitName,
@@ -5131,64 +5168,61 @@ export default function AranetUnifiedDashboard() {
                         </CardContent>
                       </Card>
 
-                      {/* Y-Axes Limits */}
+                      {/* Paramètres Techniques de la Serre */}
                       <Card className="border border-muted-foreground/15 shadow-sm bg-muted/5 rounded-2xl">
                         <CardHeader className="p-4 pb-2 border-b bg-muted/10">
                           <CardTitle className="text-xs font-black uppercase tracking-tight flex items-center gap-1.5 text-primary">
-                            <Sliders className="h-4 w-4" /> Échelles des Axes Y
+                            <Leaf className="h-4 w-4" /> Paramètres Techniques de la Serre
                           </CardTitle>
                         </CardHeader>
                         <CardContent className="p-4 space-y-3">
-                          <div className="grid grid-cols-2 gap-3">
-                            <div className="space-y-1">
-                              <label className="text-[9px] font-bold text-primary block">Axe Y Gauche</label>
-                              <div className="flex items-center gap-1">
-                                <input
-                                  type="number"
-                                  placeholder="Min"
-                                  value={yLeftMin}
-                                  onChange={(e) => setYLeftMin(e.target.value)}
-                                  className="w-full text-xs border rounded-xl bg-background p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-center h-8 font-semibold"
-                                />
-                                <input
-                                  type="number"
-                                  placeholder="Max"
-                                  value={yLeftMax}
-                                  onChange={(e) => setYLeftMax(e.target.value)}
-                                  className="w-full text-xs border rounded-xl bg-background p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-center h-8 font-semibold"
-                                />
-                              </div>
-                            </div>
-                            <div className="space-y-1">
-                              <label className="text-[9px] font-bold text-green-600 block">Axe Y Droit</label>
-                              <div className="flex items-center gap-1">
-                                <input
-                                  type="number"
-                                  placeholder="Min"
-                                  value={yRightMin}
-                                  onChange={(e) => setYRightMin(e.target.value)}
-                                  className="w-full text-xs border rounded-xl bg-background p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-center h-8 font-semibold"
-                                />
-                                <input
-                                  type="number"
-                                  placeholder="Max"
-                                  value={yRightMax}
-                                  onChange={(e) => setYRightMax(e.target.value)}
-                                  className="w-full text-xs border rounded-xl bg-background p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-center h-8 font-semibold"
-                                />
-                              </div>
-                            </div>
-                          </div>
-                          {(yLeftMin !== "" || yLeftMax !== "" || yRightMin !== "" || yRightMax !== "") && (
-                            <Button 
-                              variant="ghost" 
-                              size="xs" 
-                              onClick={() => { setYLeftMin(""); setYLeftMax(""); setYRightMin(""); setYRightMax(""); }}
-                              className="w-full text-[10px] h-7 mt-1"
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-muted-foreground uppercase font-bold">Culture</label>
+                            <select
+                              value={greenhouseCulture}
+                              onChange={(e) => {
+                                const culture = e.target.value;
+                                setGreenhouseCulture(culture);
+                                setGreenhouseCultureTypology("");
+                                commitGreenhouseSettings({ culture, cultureTypology: "" });
+                              }}
+                              className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary font-bold cursor-pointer"
                             >
-                              Réinitialiser les limites Y
-                            </Button>
-                          )}
+                              <option value="">Sélectionner...</option>
+                              {CULTURE_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-muted-foreground uppercase font-bold">Typologie de culture</label>
+                            <select
+                              value={greenhouseCultureTypology}
+                              onChange={(e) => {
+                                setGreenhouseCultureTypology(e.target.value);
+                                commitGreenhouseSettings({ cultureTypology: e.target.value });
+                              }}
+                              disabled={!greenhouseCulture || (CULTURE_TYPOLOGIES[greenhouseCulture] || []).length === 0}
+                              className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary font-bold cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              <option value="">Sélectionner...</option>
+                              {(CULTURE_TYPOLOGIES[greenhouseCulture] || []).map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-muted-foreground uppercase font-bold">Translucidité du verre (%)</label>
+                            <input
+                              type="number"
+                              min="0"
+                              max="100"
+                              value={glassTranslucidityPercent}
+                              onChange={(e) => {
+                                const raw = e.target.value;
+                                const clamped = raw === "" ? "" : String(Math.min(100, Math.max(0, Number(raw))));
+                                setGlassTranslucidityPercent(clamped);
+                                commitGreenhouseSettings({ glassTranslucidityPercent: clamped });
+                              }}
+                              className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary text-center font-bold"
+                            />
+                          </div>
                         </CardContent>
                       </Card>
 

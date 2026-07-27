@@ -246,6 +246,15 @@ async function computeAndUpsertAgroSummary(
     ? actualGain / radiationSumJcm2
     : null;
 
+  // Greenhouse-wide technical parameters (culture, typology, glass translucidity) have no
+  // browser to read from at 3am - greenhouse_settings is their single source of truth, shared
+  // with the dashboard's own read/write of the same row via /api/greenhouse-settings.
+  const { data: settings } = await supabase
+    .from("agro_greenhouse_settings")
+    .select("culture, culture_typology, glass_translucidity_percent")
+    .eq("id", 1)
+    .maybeSingle();
+
   const { error: upsertError } = await supabase.from("agro_daily_summary").upsert({
     date: dateStr,
     actual_gain: actualGain,
@@ -254,6 +263,9 @@ async function computeAndUpsertAgroSummary(
     climate,
     drops: [],
     rule_based_findings: [],
+    culture: settings?.culture ?? null,
+    culture_typology: settings?.culture_typology ?? null,
+    glass_translucidity_percent: settings?.glass_translucidity_percent ?? null,
     updated_at: new Date().toISOString()
   }, { onConflict: "date" });
   if (upsertError) throw upsertError;
