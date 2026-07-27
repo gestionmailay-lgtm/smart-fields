@@ -2,10 +2,20 @@ import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { AGRO_TIME_SLOTS, isHourInSlot } from "@/lib/agroRoleMapping";
 
+// Roles under the "Météo extérieure" category (see supabase_migrations/005_agro_roles.sql and
+// the live agro_roles catalog) describe conditions outside the greenhouse - identical for every
+// compartiment, not tied to any one of them. Kept in sync manually with agro_roles.category,
+// same trade-off as every other role-key list hardcoded in this file (gain_cumule, radiation_sum).
+const EXTERIOR_WEATHER_ROLES = new Set([
+  "temp_ext", "hr_ext", "wind_speed", "wind_direction", "rain", "radiation_instant", "radiation_sum"
+]);
+
 // Every Priva metric key encodes its compartment (1-6) as "priva_cN_...". Aranet sensors
 // (ARANET_SENSOR_CATALOG below) all belong to a single physical compartment today, matching the
-// dashboard's "Compartiment 1 (Aranet + Priva)" option - so they default to compartment "1".
-function resolveCompartment(metricKey: string): string {
+// dashboard's "Compartiment 1 (Aranet + Priva)" option - so they default to compartment "1",
+// unless their resolved role is exterior weather (shared by every compartiment - "all").
+function resolveCompartment(metricKey: string, role: string | null): string {
+  if (role && EXTERIOR_WEATHER_ROLES.has(role)) return "all";
   const match = metricKey.match(/^priva_c(\d+)_/);
   return match ? match[1] : "1";
 }
@@ -55,6 +65,22 @@ async function getPrivaToken(): Promise<string> {
   return cachedPrivaToken as string;
 }
 
+// Priva - Météo + Compartiment 1-6, duplicated from app/dashboard/aranet/page.tsx's
+// PLOTTABLE_METRICS (keep in sync if sensors are added there) - archived unconditionally every
+// night for every compartiment, not only whichever points a user happened to select in the
+// dashboard (see the plan: "toutes les données ... pour l'ensemble des compartiments").
+const PRIVA_BUILTIN_CATALOG: { metric_key: string; variable_id: string; device_id: string; device_group_id: string | null }[] = [
+  { metric_key: "priva_temp_out", variable_id: "00000214-0001-0000-0000-0000000042a9", device_id: "VP9508", device_group_id: null },
+  { metric_key: "priva_hum_out", variable_id: "00000214-0001-0000-0000-00000000427e", device_id: "VP9508", device_group_id: null },
+  { metric_key: "priva_irr_out", variable_id: "00000214-0001-0000-0000-0000000042fd", device_id: "VP9508", device_group_id: null },
+  { metric_key: "priva_wind_out", variable_id: "00000214-0001-0000-0000-0000000042ad", device_id: "VP9508", device_group_id: null },
+  ...[1, 2, 3, 4, 5, 6].flatMap(c => [
+    { metric_key: `priva_c${c}_temp`, variable_id: `0000002c-0001-000${c}-0000-0000000006f6`, device_id: "VP9508", device_group_id: null },
+    { metric_key: `priva_c${c}_temp_target`, variable_id: `0000002c-0001-000${c}-0000-0000000006e5`, device_id: "VP9508", device_group_id: null },
+    { metric_key: `priva_c${c}_hum`, variable_id: `000002bb-000${c}-0000-0000-0000000050f2`, device_id: "VP9508", device_group_id: null }
+  ])
+];
+
 async function archivePrivaForDay(
   supabase: ReturnType<typeof createAdminClient>,
   start: Date,
@@ -67,13 +93,19 @@ async function archivePrivaForDay(
     return { skipped: true, reason: `Hors fenêtre Priva (max ${PRIVA_MAX_DAYS_AGO} jours en arrière).` };
   }
 
-  const { data: points, error: pointsError } = await supabase
+  // Union of the fixed built-in catalog (every compartiment, always archived) and whatever
+  // custom Priva points a user has added via the catalog search (e.g. a dedicated exterior
+  // radiation sensor tagged "radiation_instant") - deduped by metric_key, custom points win on
+  // conflict since they're the more specific, user-confirmed choice.
+  const { data: customPoints, error: pointsError } = await supabase
     .from("priva_selected_points")
     .select("metric_key, variable_id, device_id, device_group_id");
   if (pointsError) throw pointsError;
-  if (!points || points.length === 0) {
-    return { skipped: true, reason: "Aucun point Priva sélectionné à archiver." };
-  }
+
+  const pointsByKey = new Map<string, { metric_key: string; variable_id: string; device_id: string; device_group_id: string | null }>();
+  PRIVA_BUILTIN_CATALOG.forEach(p => pointsByKey.set(p.metric_key, p));
+  (customPoints || []).forEach(p => pointsByKey.set(p.metric_key, p));
+  const points = Array.from(pointsByKey.values());
 
   const token = await getPrivaToken();
   const res = await fetch(`https://horti-api.priva.com/api/sites/${PRIVA_SITE_ID}/data`, {
@@ -112,7 +144,7 @@ async function archivePrivaForDay(
       unit: null,
       archived_for_date: dateStr,
       agro_role: roleByMetricKey.get(point.metric_key) || null,
-      compartment: resolveCompartment(point.metric_key)
+      compartment: resolveCompartment(point.metric_key, roleByMetricKey.get(point.metric_key) || null)
     }));
 
     for (let i = 0; i < rows.length; i += 500) {
@@ -300,14 +332,11 @@ export async function GET(req: NextRequest) {
     const daysAgo = Number.isFinite(daysAgoParam) && daysAgoParam >= 1 ? daysAgoParam : 1;
     const { start, end, dateStr } = getDayBounds(daysAgo);
 
-    const { data: selected, error: selError } = await supabase
-      .from("aranet_selected_sensors")
-      .select("metric_key")
-      .in("scope", ["climat_croissance", "ferti_irrigation"]);
-    if (selError) throw selError;
-
-    const metricKeys = Array.from(new Set((selected || []).map(r => r.metric_key)))
-      .filter(k => ARANET_SENSOR_CATALOG[k]);
+    // Every Aranet sensor in the catalog is archived unconditionally every night, not only
+    // whichever ones a user happened to have checked in the dashboard - "toutes les données".
+    // aranet_selected_sensors still exists (still mirrored from the client) but no longer gates
+    // what the cron archives.
+    const metricKeys = Object.keys(ARANET_SENSOR_CATALOG);
 
     // Loaded once up front (not per-loop/per-summary) so every archived row - Aranet or Priva -
     // can be tagged with its resolved agro_role at write time, homogenizing the raw archive
@@ -353,7 +382,7 @@ export async function GET(req: NextRequest) {
           unit: defaultUnit,
           archived_for_date: dateStr,
           agro_role: roleByMetricKey.get(metricKey) || null,
-          compartment: resolveCompartment(metricKey)
+          compartment: resolveCompartment(metricKey, roleByMetricKey.get(metricKey) || null)
         }));
 
         // Chunk inserts to stay well under request size limits.
