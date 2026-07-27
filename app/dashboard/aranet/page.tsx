@@ -895,13 +895,14 @@ export default function AranetUnifiedDashboard() {
     "temp_rh_top_2",
     "slab_ec_wc_8",
     "slab_weight_7",
+    "plant_weight_7",
     "plant_weight_gain"
   ]);
   // Every default-selected sensor is loaded (fetched) from first load, but only "Cumulative
-  // Gain" is visible on the chart out of the box - the rest stay loaded-but-hidden so the first
-  // impression isn't a cluttered chart; the operator can reveal them from the legend below.
-  // Only applies to brand-new sessions (overwritten by the saved localStorage selection below,
-  // same as selectedKeys itself).
+  // Gain" and "Plant weight" are visible on the chart out of the box - the rest stay
+  // loaded-but-hidden so the first impression isn't a cluttered chart; the operator can reveal
+  // them from the colored legend below. Only applies to brand-new sessions (overwritten by the
+  // saved localStorage selection below, same as selectedKeys itself).
   const [hiddenKeysOnChart, setHiddenKeysOnChart] = useState<string[]>([
     "temp_rh_top_1",
     "temp_rh_top_2",
@@ -1229,11 +1230,14 @@ export default function AranetUnifiedDashboard() {
   // Any sensor (Aranet or Priva) can be added here, not just the original fixed slab/weight set.
   const [fertiSelectedKeys, setFertiSelectedKeys] = useState<string[]>([
     ...FERTI_METRIC_KEYS,
+    "plant_weight_7",
     "plant_weight_gain"
   ]);
   // Same "loaded but hidden by default" pattern as hiddenKeysOnChart for Climat/Croissance -
-  // only Gain Cumulé is visible out of the box, the substrate/weight sensors stay loaded and
-  // revealable from the legend. Only applies to brand-new sessions (no saved selection yet).
+  // only Gain Cumulé and Plant weight are visible out of the box, the substrate sensors stay
+  // loaded and revealable from the colored legend. Only applies to brand-new sessions (no saved
+  // selection yet - see the localStorage load/save effects for fertiSelectedKeys below, which
+  // now persist whatever the user actually checks/unchecks here across reloads).
   const [hiddenFertiKeysOnChart, setHiddenFertiKeysOnChart] = useState<string[]>(FERTI_METRIC_KEYS);
   const [fertiRawDataMap, setFertiRawDataMap] = useState<{ [key: string]: any[] }>({});
   const [fertiLoading, setFertiLoading] = useState(false);
@@ -1561,7 +1565,22 @@ export default function AranetUnifiedDashboard() {
       if (savedKeys) {
         setSelectedKeys(JSON.parse(savedKeys));
       }
-      
+      // fertiSelectedKeys/hiddenFertiKeysOnChart were never persisted before - every reload fell
+      // back to the hardcoded default (FERTI_METRIC_KEYS, which includes "Bulk EC"), silently
+      // undoing whatever the user had unchecked. Now behaves exactly like selectedKeys above.
+      const savedFertiKeys = localStorage.getItem("aranet_ferti_selected_keys");
+      if (savedFertiKeys) {
+        setFertiSelectedKeys(JSON.parse(savedFertiKeys));
+      }
+      const savedHiddenFertiKeys = localStorage.getItem("aranet_hidden_ferti_keys");
+      if (savedHiddenFertiKeys) {
+        setHiddenFertiKeysOnChart(JSON.parse(savedHiddenFertiKeys));
+      }
+      const savedHiddenKeys = localStorage.getItem("aranet_hidden_keys");
+      if (savedHiddenKeys) {
+        setHiddenKeysOnChart(JSON.parse(savedHiddenKeys));
+      }
+
       const savedConfigs = localStorage.getItem("aranet_metric_configs");
       if (savedConfigs) {
         activeConfigs = JSON.parse(savedConfigs);
@@ -1649,6 +1668,9 @@ export default function AranetUnifiedDashboard() {
     if (!isLoaded) return;
     try {
       localStorage.setItem("aranet_selected_keys", JSON.stringify(selectedKeys));
+      localStorage.setItem("aranet_hidden_keys", JSON.stringify(hiddenKeysOnChart));
+      localStorage.setItem("aranet_ferti_selected_keys", JSON.stringify(fertiSelectedKeys));
+      localStorage.setItem("aranet_hidden_ferti_keys", JSON.stringify(hiddenFertiKeysOnChart));
       localStorage.setItem("aranet_metric_configs", JSON.stringify(metricConfigs));
       localStorage.setItem("aranet_plants_on_scale", String(plantsOnScale));
       localStorage.setItem("aranet_density_per_m2", String(densityPerM2));
@@ -1662,7 +1684,7 @@ export default function AranetUnifiedDashboard() {
     } catch (e) {
       console.error("Failed to save configurations", e);
     }
-  }, [selectedKeys, metricConfigs, isLoaded, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, dailyAdjustedWeights, showAnnotations, customPrivaMetrics, timeStep, manualDrops]);
+  }, [selectedKeys, hiddenKeysOnChart, fertiSelectedKeys, hiddenFertiKeysOnChart, metricConfigs, isLoaded, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, dailyAdjustedWeights, showAnnotations, customPrivaMetrics, timeStep, manualDrops]);
 
   // Mirror the current sensor selection into Supabase (debounced) so the daily archive cron
   // job - which runs server-side with no access to localStorage - knows which Aranet sensors
