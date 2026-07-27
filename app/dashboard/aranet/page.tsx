@@ -887,13 +887,20 @@ export default function AranetUnifiedDashboard() {
   // because allMetrics needs it immediately - see the draft-editing note near metricConfigsDraft.
   const [customPrivaMetricsDraft, setCustomPrivaMetricsDraft] = useState<any[]>([]);
 
-  // Reads the draft custom Priva metrics (not the validated ones) so a newly-added custom point
-  // shows up immediately in "Sélection des données" before being saved - see the plan note on
-  // customPrivaMetricsDraft. Harmless everywhere else: a draft-only custom metric that isn't yet
-  // in the validated selectedKeys/fertiSelectedKeys simply never gets plotted.
+  // Union of the validated custom Priva metrics and the draft ones, deduped by key. Must
+  // include the validated set: every fetch/chart-rendering code path resolves a committed
+  // key's variableId/deviceId/color etc. through allMetrics.find(...), and a validated
+  // selectedKeys/fertiSelectedKeys entry that isn't in allMetrics crashes with "Cannot read
+  // properties of undefined" (was broken briefly by reading only customPrivaMetricsDraft here).
+  // Also includes the draft set so a custom Priva point just added in "Sélection des données"
+  // shows up immediately there, before being saved.
   const allMetrics = useMemo(() => {
-    return [...PLOTTABLE_METRICS, ...customPrivaMetricsDraft];
-  }, [customPrivaMetricsDraft]);
+    const merged = [...PLOTTABLE_METRICS, ...customPrivaMetrics];
+    customPrivaMetricsDraft.forEach(m => {
+      if (!merged.some(existing => existing.key === m.key)) merged.push(m);
+    });
+    return merged;
+  }, [customPrivaMetrics, customPrivaMetricsDraft]);
 
   const [activeTab, setActiveTab] = useState<"agronomic" | "selection" | "charts" | "chutes" | "fertigation">("charts");
   const [selectedDayNum, setSelectedDayNum] = useState<number>(1);
