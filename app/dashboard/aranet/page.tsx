@@ -1558,11 +1558,15 @@ export default function AranetUnifiedDashboard() {
 
   // Load from localStorage on mount and initialize configurations
   useEffect(() => {
+    let cancelled = false;
     let activeConfigs: any = {};
     let savedCustom: any[] = [];
+    let hasLocalSelection = false;
+    async function load() {
     try {
       const savedKeys = localStorage.getItem("aranet_selected_keys");
       if (savedKeys) {
+        hasLocalSelection = true;
         setSelectedKeys(JSON.parse(savedKeys));
       }
       // fertiSelectedKeys/hiddenFertiKeysOnChart were never persisted before - every reload fell
@@ -1647,6 +1651,40 @@ export default function AranetUnifiedDashboard() {
       console.error("Failed to load saved configurations", e);
     }
 
+    // This browser has no local "Sélection des données" at all (fresh browser, cleared cache,
+    // private window) - exactly the scenario where a configuration done on another browser
+    // looked entirely lost even though nothing was actually deleted anywhere. Pull the last
+    // automatically-saved server backup instead of falling back straight to factory defaults.
+    if (!hasLocalSelection) {
+      try {
+        const res = await fetch("/api/aranet/dashboard-config");
+        const data = await res.json();
+        const backup = data?.config;
+        if (backup && !cancelled) {
+          if (Array.isArray(backup.selectedKeys) && backup.selectedKeys.length > 0) setSelectedKeys(backup.selectedKeys);
+          if (Array.isArray(backup.fertiSelectedKeys)) setFertiSelectedKeys(backup.fertiSelectedKeys);
+          if (Array.isArray(backup.hiddenKeysOnChart)) setHiddenKeysOnChart(backup.hiddenKeysOnChart);
+          if (Array.isArray(backup.hiddenFertiKeysOnChart)) setHiddenFertiKeysOnChart(backup.hiddenFertiKeysOnChart);
+          if (backup.metricConfigs && typeof backup.metricConfigs === "object") activeConfigs = backup.metricConfigs;
+          if (Array.isArray(backup.customPrivaMetrics)) {
+            savedCustom = backup.customPrivaMetrics;
+            setCustomPrivaMetrics(savedCustom);
+          }
+          if (typeof backup.plantsOnScale === "number" && backup.plantsOnScale > 0) {
+            setPlantsOnScale(backup.plantsOnScale);
+            setPlantsOnScaleDraft(String(backup.plantsOnScale));
+          }
+          if (typeof backup.densityPerM2 === "number" && backup.densityPerM2 > 0) {
+            setDensityPerM2(backup.densityPerM2);
+            setDensityPerM2Draft(String(backup.densityPerM2));
+          }
+          if (typeof backup.conversionRatio === "number" && backup.conversionRatio > 0) setConversionRatio(backup.conversionRatio);
+        }
+      } catch (e) {
+        console.error("Failed to load server backup of data selection:", e);
+      }
+    }
+
     // Merge/initialize missing configs for both built-in and saved custom metrics
     const combined = [...PLOTTABLE_METRICS, ...savedCustom];
     combined.forEach(m => {
@@ -1659,8 +1697,13 @@ export default function AranetUnifiedDashboard() {
       }
     });
 
-    setMetricConfigs(activeConfigs);
-    setIsLoaded(true);
+    if (!cancelled) {
+      setMetricConfigs(activeConfigs);
+      setIsLoaded(true);
+    }
+    }
+    load();
+    return () => { cancelled = true; };
   }, []);
 
   // Save to localStorage when selectedKeys or metricConfigs change (only after initial load)
@@ -1685,6 +1728,41 @@ export default function AranetUnifiedDashboard() {
       console.error("Failed to save configurations", e);
     }
   }, [selectedKeys, hiddenKeysOnChart, fertiSelectedKeys, hiddenFertiKeysOnChart, metricConfigs, isLoaded, plantsOnScale, densityPerM2, conversionRatio, dailyEvents, dailyAdjustedWeights, showAnnotations, customPrivaMetrics, timeStep, manualDrops]);
+
+  // Automatic full backup of "Sélection des données" to Supabase (debounced) - see
+  // supabase_migrations/008_dashboard_config_backup.sql. Distinct from the narrower
+  // metric-roles/priva-selected-points/selected-sensors mirrors below (which only cover what
+  // the cron needs): this is the full picture - axis/color/smoothing/custom-name per sensor,
+  // custom Priva points, physiological parameters - so a fresh browser can restore the whole
+  // screen at once via the fetch in the load effect above, instead of the user having to
+  // reconfigure everything from scratch just because they opened a different browser/session.
+  const dashboardConfigBackupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (dashboardConfigBackupTimeoutRef.current) clearTimeout(dashboardConfigBackupTimeoutRef.current);
+    dashboardConfigBackupTimeoutRef.current = setTimeout(() => {
+      fetch("/api/aranet/dashboard-config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: {
+            selectedKeys,
+            fertiSelectedKeys,
+            hiddenKeysOnChart,
+            hiddenFertiKeysOnChart,
+            metricConfigs,
+            customPrivaMetrics,
+            plantsOnScale,
+            densityPerM2,
+            conversionRatio
+          }
+        })
+      }).catch(e => console.error("Failed to back up data selection:", e));
+    }, 1500);
+    return () => {
+      if (dashboardConfigBackupTimeoutRef.current) clearTimeout(dashboardConfigBackupTimeoutRef.current);
+    };
+  }, [selectedKeys, fertiSelectedKeys, hiddenKeysOnChart, hiddenFertiKeysOnChart, metricConfigs, customPrivaMetrics, plantsOnScale, densityPerM2, conversionRatio, isLoaded]);
 
   // Mirror the current sensor selection into Supabase (debounced) so the daily archive cron
   // job - which runs server-side with no access to localStorage - knows which Aranet sensors
