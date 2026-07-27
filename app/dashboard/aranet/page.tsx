@@ -24,15 +24,11 @@ import {
   Square,
   Sparkles,
   Menu,
-  Award,
   TrendingUp,
-  TrendingDown,
-  CheckCircle2,
   AlertTriangle,
   Info,
   Gauge,
   Lightbulb,
-  ShieldAlert,
   Droplets,
   Tag,
   Leaf
@@ -5598,51 +5594,6 @@ export default function AranetUnifiedDashboard() {
                   </div>
                 )}
 
-                {/* Model calibration settings */}
-                <div className="bg-background border border-border p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-sm">
-                  <div className="flex flex-col gap-0.5">
-                    <h4 className="text-xs font-black uppercase text-foreground">Paramétrage du Modèle Horticole</h4>
-                    <p className="text-[10px] text-muted-foreground font-semibold">Ajustez le coefficient de conversion lumière/biomasse selon vos observations.</p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-4">
-                    <div className="flex items-center gap-3">
-                      <span className="text-[10px] font-bold text-slate-500 uppercase">Efficacité de Conversion :</span>
-                      <div className="flex items-center gap-1.5 bg-muted/30 px-2 py-1 rounded-lg border border-border/40">
-                        <input
-                          type="number"
-                          step="0.1"
-                          min="0.1"
-                          max="5.0"
-                          value={conversionRatio}
-                          onChange={(e) => setConversionRatio(Math.max(0.1, parseFloat(e.target.value) || 1.0))}
-                          className="w-12 bg-transparent text-center font-mono font-bold text-xs focus:outline-none"
-                        />
-                        <span className="text-[10px] font-bold text-muted-foreground uppercase">g / 100 J/cm²</span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      {hasUnsavedChanges && (
-                        <span className="text-[9px] font-bold text-amber-500 flex items-center animate-pulse mr-1">
-                          ⚠️ Non enregistré
-                        </span>
-                      )}
-                      <Button
-                        size="xs"
-                        disabled={!hasUnsavedChanges}
-                        onClick={handleSaveAdjustments}
-                        className={`font-black text-[10px] uppercase px-3 py-1 rounded-lg transition-all shadow-sm ${
-                          hasUnsavedChanges 
-                            ? "bg-emerald-600 hover:bg-emerald-700 text-white" 
-                            : "bg-slate-100 dark:bg-slate-800 text-muted-foreground border cursor-not-allowed"
-                        }`}
-                      >
-                        💾 Valider les corrections
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-
                 {/* Agent IA agronomique persistant : ce que l'historique de cette serre a
                     statistiquement montré - support de l'analyse ci-dessous, pas un onglet séparé.
                     La base bibliographique elle-même n'a pas d'UI dashboard : elle s'alimente
@@ -5698,167 +5649,9 @@ export default function AranetUnifiedDashboard() {
                   return null;
                 })()}
 
-                {/* Global Performance Summary Cards */}
-                {(() => {
-                  const daysCount = agronomicDataWithBenchmark.length;
-                  if (daysCount === 0) {
-                    return (
-                      <div className="grid grid-cols-1 md:grid-cols-4 gap-6 w-full">
-                        <Card className="border-none shadow-md bg-background rounded-2xl md:col-span-4 p-8 text-center text-xs text-muted-foreground font-bold">
-                          Aucune donnée disponible pour cette période. Vérifiez la plage de dates ci-dessus, ou sélectionnez des capteurs dans l&apos;onglet &quot;Sélection des données&quot;.
-                        </Card>
-                      </div>
-                    );
-                  }
-
-                  const hasRadiationData = agronomicDataWithBenchmark.some(d => d.radiationSumJcm2 !== null);
-                  const avgScore = Math.round(agronomicDataWithBenchmark.reduce((sum, d) => sum + d.overallScore, 0) / daysCount);
-                  const totalLoss = agronomicDataWithBenchmark.reduce((sum, d) => sum + (d.lostGainVsBestDay ?? 0), 0);
-                  const optimalDays = agronomicDataWithBenchmark.filter(d => d.status === "Optimal").length;
-                  const alertDays = agronomicDataWithBenchmark.filter(d => d.status === "Alerte Climat").length;
-
-                  return (
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-6 w-full">
-                      <Card className="border-none shadow-md bg-background rounded-2xl md:col-span-1">
-                        <CardContent className="p-5 flex items-center gap-4">
-                          <div className="p-3 bg-emerald-500/10 text-emerald-500 rounded-xl">
-                            <Award className="h-5 w-5" />
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">Score Agronomique Moyen</p>
-                            <h3 className="text-xl font-black text-foreground">{avgScore} / 100</h3>
-                            <p className="text-[10px] text-emerald-500 font-semibold mt-0.5">
-                              {avgScore >= 90 ? "Excellent niveau" : avgScore >= 75 ? "Niveau satisfaisant" : "Ajustements urgents requis"}
-                            </p>
-                          </div>
-                        </CardContent>
-                      </Card>
-
-                      <Card className="border-none shadow-md bg-gradient-to-br from-rose-500/5 to-transparent border border-rose-500/10 rounded-2xl md:col-span-2">
-                        <CardContent className="p-5 flex items-center gap-4">
-                          <div className="p-3 bg-rose-500/10 text-rose-500 rounded-xl">
-                            <TrendingDown className="h-5 w-5 animate-pulse" />
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider font-black">Potentiel de Gain Cumulé Perdu</p>
-                            <h3 className="text-xl font-black text-rose-600">
-                              {hasRadiationData ? `-${totalLoss.toFixed(1)} g/m²` : "N/A"}
-                            </h3>
-                            <p className="text-[9px] text-rose-500 font-bold mt-1 leading-snug">
-                              {hasRadiationData
-                                ? `Par rapport à la meilleure journée d'efficience lumière/gain de la plage affichée, ${totalLoss.toFixed(1)} g/m² supplémentaire aurait été atteignable.`
-                                : "Cochez la variable Somme de Rayonnement (J/cm²) pour afficher le potentiel perdu."
-                              }
-                            </p>
-                          </div>
-                        </CardContent>
-                      </Card>
-
-                      <Card className="border-none shadow-md bg-background rounded-2xl md:col-span-1">
-                        <CardContent className="p-5 flex items-center gap-4">
-                          <div className="p-3 bg-blue-500/10 text-blue-500 rounded-xl">
-                            <CheckCircle2 className="h-5 w-5" />
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">Jours Optimaux</p>
-                            <h3 className="text-xl font-black text-foreground">{optimalDays} / {daysCount}</h3>
-                            <p className="text-[10px] text-muted-foreground font-semibold mt-0.5">Climat de cible atteint</p>
-                          </div>
-                        </CardContent>
-                      </Card>
-
-                      <Card className="border-none shadow-md bg-background rounded-2xl md:col-span-1">
-                        <CardContent className="p-5 flex items-center gap-4">
-                          <div className="p-3 bg-rose-500/10 text-rose-500 rounded-xl">
-                            <ShieldAlert className="h-5 w-5" />
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">Alertes Climat</p>
-                            <h3 className="text-xl font-black text-rose-500">{alertDays} Jours</h3>
-                            <p className="text-[10px] text-rose-400 font-semibold mt-0.5">Fermeture stomatique</p>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    </div>
-                  );
-                })()}
-
                 {/* Main Grid */}
                 {agronomicDataWithBenchmark.length > 0 ? (
                   <div className="space-y-6 w-full">
-                    {/* Potentiel (meilleure efficience prouvée par cette serre) vs gain réellement
-                        réalisé, jour par jour, tous deux exprimés en g / 100 J/cm² de rayonnement
-                        reçu - une unité à échelle humaine plutôt que le ratio brut g/m² par J/cm². */}
-                    <Card className="border border-border/80 shadow-md bg-background rounded-2xl overflow-hidden">
-                      <CardHeader className="p-5 pb-3 border-b bg-muted/5">
-                        <CardTitle className="text-xs font-black uppercase tracking-tight flex items-center gap-2">
-                          <Gauge className="h-4 w-4 text-primary" /> Potentiel vs Gain Réalisé (g / 100 J/cm²)
-                        </CardTitle>
-                        <CardDescription className="text-[10px] font-semibold mt-0.5">
-                          Le potentiel est l&apos;efficience lumière→croissance de la meilleure journée observée sur la période (référence prouvée par cette serre). L&apos;écart avec le réalisé, jour par jour, indique la marge de gain non exploitée.
-                        </CardDescription>
-                      </CardHeader>
-                      <CardContent className="p-4">
-                        <div className="w-full h-[320px]">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={agronomicDataWithBenchmark} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
-                              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
-                              <XAxis
-                                dataKey="dateStr"
-                                tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
-                                axisLine={false}
-                                tickLine={false}
-                                dy={5}
-                              />
-                              <YAxis
-                                tick={{ fontSize: 8, fill: "#64748b" }}
-                                width={32}
-                                label={{ value: "g / 100 J/cm²", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fill: "#64748b", fontSize: 8, fontWeight: "bold" } }}
-                              />
-                              <Tooltip content={({ active, payload, label }: any) => {
-                                if (!active || !payload || !payload.length) return null;
-                                const day = agronomicDataWithBenchmark.find((d: any) => d.dateStr === label);
-                                return (
-                                  <div className="bg-background border border-muted-foreground/20 p-2.5 rounded-xl shadow-lg space-y-1 text-[11px] z-30">
-                                    <p className="font-bold text-foreground">{label}</p>
-                                    {payload.map((item: any) => (
-                                      <p key={item.dataKey} style={{ color: item.color }} className="font-semibold">
-                                        {item.name} : {item.value !== null && item.value !== undefined ? `${item.value} g / 100 J/cm²` : "N/A"}
-                                      </p>
-                                    ))}
-                                    {day?.lostPercentVsBestDay !== null && day?.lostPercentVsBestDay !== undefined && (
-                                      <p className="text-rose-500 font-bold pt-1 border-t border-border/30 mt-1">
-                                        ⚠️ {day.lostPercentVsBestDay}% sous le potentiel prouvé
-                                      </p>
-                                    )}
-                                  </div>
-                                );
-                              }} />
-                              <Legend verticalAlign="bottom" iconType="plainline" iconSize={12} wrapperStyle={{ paddingTop: 10, fontSize: '10px', fontWeight: '600' }} />
-
-                              <Line type="monotone" dataKey="potentialEfficiencyPer100J" name="Potentiel" stroke="#7c3aed" strokeWidth={2} strokeDasharray="4 3" dot={false} connectNulls={true} isAnimationActive={false} />
-                              <Line type="monotone" dataKey="realizedEfficiencyPer100J" name="Réalisé" stroke="#22c55e" strokeWidth={2.5} dot={{ r: 3 }} connectNulls={true} isAnimationActive={false} />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        </div>
-
-                        {/* Per-day limiting factor recap, so the bottleneck is readable at a glance
-                            without having to hover every point of the chart. */}
-                        <div className="flex flex-wrap gap-1.5 mt-3 pt-3 border-t">
-                          {agronomicDataWithBenchmark.map((d: any) => (
-                            <div key={`limiting-${d.dateStr}`} className="px-2 py-1 rounded-lg bg-muted/20 border border-border/40 text-[9px] font-semibold flex items-center gap-1.5">
-                              <span className="font-black text-foreground">{d.dateStr}</span>
-                              {d.limitingFactorLabel ? (
-                                <span className="text-rose-500">{d.limitingFactorLabel} ({d.limitingFactorScore})</span>
-                              ) : (
-                                <span className="text-muted-foreground opacity-60">Données insuffisantes</span>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      </CardContent>
-                    </Card>
-
                     {/* Full Width Table Card */}
                     <Card className="border border-border/80 shadow-md bg-background rounded-2xl overflow-hidden">
                       <CardHeader className="p-5 pb-3 border-b bg-muted/5">
