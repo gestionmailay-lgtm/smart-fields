@@ -883,10 +883,17 @@ const AGRONOMIC_DATA: AgronomicDay[] = [
 
 export default function AranetUnifiedDashboard() {
   const [customPrivaMetrics, setCustomPrivaMetrics] = useState<any[]>([]);
+  // Declared here (not alongside the other "Sélection des données" draft state further below)
+  // because allMetrics needs it immediately - see the draft-editing note near metricConfigsDraft.
+  const [customPrivaMetricsDraft, setCustomPrivaMetricsDraft] = useState<any[]>([]);
 
+  // Reads the draft custom Priva metrics (not the validated ones) so a newly-added custom point
+  // shows up immediately in "Sélection des données" before being saved - see the plan note on
+  // customPrivaMetricsDraft. Harmless everywhere else: a draft-only custom metric that isn't yet
+  // in the validated selectedKeys/fertiSelectedKeys simply never gets plotted.
   const allMetrics = useMemo(() => {
-    return [...PLOTTABLE_METRICS, ...customPrivaMetrics];
-  }, [customPrivaMetrics]);
+    return [...PLOTTABLE_METRICS, ...customPrivaMetricsDraft];
+  }, [customPrivaMetricsDraft]);
 
   const [activeTab, setActiveTab] = useState<"agronomic" | "selection" | "charts" | "chutes" | "fertigation">("charts");
   const [selectedDayNum, setSelectedDayNum] = useState<number>(1);
@@ -1119,6 +1126,18 @@ export default function AranetUnifiedDashboard() {
       [customKey: string]: any;
     };
   }>({});
+
+  // Draft copies of selectedKeys/fertiSelectedKeys/metricConfigs/customPrivaMetrics, edited
+  // exclusively by the "Sélection des données" screen. Every other part of the app (charts,
+  // agroAnalysisKeys, all fetch/sync effects) keeps reading the validated state above -
+  // metricConfigs used to feed agroAnalysisKeys directly, so even an unrelated edit like typing
+  // a custom name triggered a full Analyseur Agronomique refetch + heavy weight-drop-detection
+  // recompute + several Supabase syncs on every keystroke. Draft state lets the screen update
+  // instantly (pure client state, no recompute) while edits stay inert until explicitly saved -
+  // see hasUnsavedSelectionChanges/handleSaveSelection below.
+  const [selectedKeysDraft, setSelectedKeysDraft] = useState<string[]>([]);
+  const [fertiSelectedKeysDraft, setFertiSelectedKeysDraft] = useState<string[]>([]);
+  const [metricConfigsDraft, setMetricConfigsDraft] = useState<typeof metricConfigs>({});
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1706,6 +1725,17 @@ export default function AranetUnifiedDashboard() {
     return () => { cancelled = true; };
   }, []);
 
+  // Seed the draft copies once loading (including any server-backup restore above) has
+  // settled, so "Sélection des données" starts in sync with the validated state.
+  useEffect(() => {
+    if (!isLoaded) return;
+    setSelectedKeysDraft(selectedKeys);
+    setFertiSelectedKeysDraft(fertiSelectedKeys);
+    setMetricConfigsDraft(metricConfigs);
+    setCustomPrivaMetricsDraft(customPrivaMetrics);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoaded]);
+
   // Save to localStorage when selectedKeys or metricConfigs change (only after initial load)
   useEffect(() => {
     if (!isLoaded) return;
@@ -1848,14 +1878,16 @@ export default function AranetUnifiedDashboard() {
     };
   }, [selectedKeys, fertiSelectedKeys, allMetrics, isLoaded]);
 
+  // Edits the draft only - see the draft-editing note near metricConfigsDraft. Applied to the
+  // validated selectedKeys/fertiSelectedKeys only via handleSaveSelection.
   const toggleKey = (key: string) => {
-    setSelectedKeys(prev =>
+    setSelectedKeysDraft(prev =>
       prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
     );
   };
 
   const toggleFertiKey = (key: string) => {
-    setFertiSelectedKeys(prev =>
+    setFertiSelectedKeysDraft(prev =>
       prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
     );
   };
@@ -1874,6 +1906,57 @@ export default function AranetUnifiedDashboard() {
     } catch (e) {
       console.error("Failed to save adjustments", e);
     }
+  };
+
+  // "Sélection des données" unsaved-changes detection + explicit save/discard - same pattern as
+  // hasUnsavedChanges/handleSaveAdjustments above. Saving is the single point where the
+  // validated selectedKeys/fertiSelectedKeys/metricConfigs/customPrivaMetrics actually change,
+  // which is what (deliberately, once) kicks off the Analyseur Agronomique refetch, the
+  // Climat/Croissance refetch if selectedKeys changed, and every Supabase sync effect below.
+  const hasUnsavedSelectionChanges = useMemo(() => {
+    return JSON.stringify(selectedKeysDraft) !== JSON.stringify(selectedKeys) ||
+           JSON.stringify(fertiSelectedKeysDraft) !== JSON.stringify(fertiSelectedKeys) ||
+           JSON.stringify(metricConfigsDraft) !== JSON.stringify(metricConfigs) ||
+           JSON.stringify(customPrivaMetricsDraft) !== JSON.stringify(customPrivaMetrics);
+  }, [selectedKeysDraft, selectedKeys, fertiSelectedKeysDraft, fertiSelectedKeys, metricConfigsDraft, metricConfigs, customPrivaMetricsDraft, customPrivaMetrics]);
+
+  const handleSaveSelection = () => {
+    setSelectedKeys(selectedKeysDraft);
+    setFertiSelectedKeys(fertiSelectedKeysDraft);
+    setMetricConfigs(metricConfigsDraft);
+    setCustomPrivaMetrics(customPrivaMetricsDraft);
+  };
+
+  const handleDiscardSelection = () => {
+    setSelectedKeysDraft(selectedKeys);
+    setFertiSelectedKeysDraft(fertiSelectedKeys);
+    setMetricConfigsDraft(metricConfigs);
+    setCustomPrivaMetricsDraft(customPrivaMetrics);
+  };
+
+  // Native browser "leave site?" prompt when closing the tab/refreshing/navigating away with
+  // unsaved "Sélection des données" changes - browsers don't allow custom text in this dialog,
+  // only whether it appears at all (governed by calling preventDefault/setting returnValue).
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (!hasUnsavedSelectionChanges) return;
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [hasUnsavedSelectionChanges]);
+
+  // Switching tabs is an in-app state change, not a real page unload, so beforeunload never
+  // fires for it - guarded separately with a confirmation modal (Enregistrer/Ignorer/Annuler)
+  // whenever leaving "Sélection des données" with unsaved changes.
+  const [pendingTabSwitch, setPendingTabSwitch] = useState<typeof activeTab | null>(null);
+  const requestTabChange = (tab: typeof activeTab) => {
+    if (activeTab === "selection" && tab !== "selection" && hasUnsavedSelectionChanges) {
+      setPendingTabSwitch(tab);
+      return;
+    }
+    setActiveTab(tab);
   };
 
   const handleAddManualDrop = () => {
@@ -1953,18 +2036,19 @@ export default function AranetUnifiedDashboard() {
     }
   };
 
-  // Helper to toggle custom datapoint from full catalog
+  // Helper to toggle custom datapoint from full catalog. Edits the draft only - see the
+  // draft-editing note near metricConfigsDraft.
   const toggleCatalogDatapoint = (dp: any) => {
     const builtIn = PLOTTABLE_METRICS.find(m => m.variableId === dp.variableId);
     const key = builtIn ? builtIn.key : `priva_custom_${dp.variableId}`;
 
-    if (selectedKeys.includes(key)) {
-      setSelectedKeys(prev => prev.filter(k => k !== key));
+    if (selectedKeysDraft.includes(key)) {
+      setSelectedKeysDraft(prev => prev.filter(k => k !== key));
     } else {
       if (!builtIn) {
         const colors = ["#ec4899", "#f43f5e", "#a855f7", "#6366f1", "#06b6d4", "#14b8a6", "#10b981", "#84cc16", "#eab308"];
         const randomColor = colors[Math.floor(Math.random() * colors.length)];
-        
+
         const newMetric = {
           key,
           name: `Priva - ${dp.name}`,
@@ -1976,36 +2060,36 @@ export default function AranetUnifiedDashboard() {
           color: randomColor,
           units: [{ id: dp.unit || "custom", name: dp.unit || "N/A" }]
         };
-        
-        if (!customPrivaMetrics.some(m => m.key === key)) {
-          setCustomPrivaMetrics(prev => [...prev, newMetric]);
+
+        if (!customPrivaMetricsDraft.some(m => m.key === key)) {
+          setCustomPrivaMetricsDraft(prev => [...prev, newMetric]);
         }
       }
-      setSelectedKeys(prev => [...prev, key]);
+      setSelectedKeysDraft(prev => [...prev, key]);
     }
   };
 
   const isDatapointSelected = (dp: any) => {
     const builtIn = PLOTTABLE_METRICS.find(m => m.variableId === dp.variableId);
     const key = builtIn ? builtIn.key : `priva_custom_${dp.variableId}`;
-    return selectedKeys.includes(key);
+    return selectedKeysDraft.includes(key);
   };
 
+  // Edits the draft only. The immediate fetchActiveData() this used to fire on a unit change no
+  // longer makes sense pre-save - the unit change is picked up by the normal fetch that
+  // handleSaveSelection triggers once, like every other field.
   const updateMetricConfig = (key: string, field: string, value: any) => {
-    setMetricConfigs(prev => ({
+    setMetricConfigsDraft(prev => ({
       ...prev,
       [key]: {
         ...prev[key],
         [field]: value
       }
     }));
-    if (field === "unit") {
-      fetchActiveData();
-    }
   };
 
   const applyGlobalSmoothing = (smooth: boolean) => {
-    setMetricConfigs(prev => {
+    setMetricConfigsDraft(prev => {
       const next = { ...prev };
       allMetrics.forEach(m => {
         next[m.key] = {
@@ -2018,7 +2102,7 @@ export default function AranetUnifiedDashboard() {
   };
 
   const applyGlobalWindowSize = (size: number) => {
-    setMetricConfigs(prev => {
+    setMetricConfigsDraft(prev => {
       const next = { ...prev };
       allMetrics.forEach(m => {
         next[m.key] = {
@@ -3560,7 +3644,7 @@ export default function AranetUnifiedDashboard() {
   // for EITHER graph (Climat/Croissance or Ferti Irrigation) - a sensor only ticked FERTI must
   // still show up on the left, not get stranded on the right as if nothing had been chosen.
   const visibleMetrics = allMetrics.filter(m => {
-    if (!selectedKeys.includes(m.key) && !fertiSelectedKeys.includes(m.key)) return false;
+    if (!selectedKeysDraft.includes(m.key) && !fertiSelectedKeysDraft.includes(m.key)) return false;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -3573,7 +3657,7 @@ export default function AranetUnifiedDashboard() {
   });
 
   const hiddenMetrics = allMetrics.filter(m => {
-    if (selectedKeys.includes(m.key) || fertiSelectedKeys.includes(m.key)) return false;
+    if (selectedKeysDraft.includes(m.key) || fertiSelectedKeysDraft.includes(m.key)) return false;
     // Aranet only exists in Compartment 1
     if (!m.isPriva && selectedCompartment !== "1" && selectedCompartment !== "all") return false;
     // Priva compartment metrics must match selectedCompartment
@@ -3604,9 +3688,9 @@ export default function AranetUnifiedDashboard() {
   // separate sensor picker, which made it easy to end up with the same sensor duplicated or
   // missing across the two without noticing.
   const renderSensorItem = (m: any) => {
-    const isSelected = selectedKeys.includes(m.key);
-    const isFertiSelected = fertiSelectedKeys.includes(m.key);
-    const config = metricConfigs[m.key] || { unit: m.units[0].id, range: "24h", axis: "left", color: m.color, smooth: false, sgWindow: 9 };
+    const isSelected = selectedKeysDraft.includes(m.key);
+    const isFertiSelected = fertiSelectedKeysDraft.includes(m.key);
+    const config = metricConfigsDraft[m.key] || { unit: m.units[0].id, range: "24h", axis: "left", color: m.color, smooth: false, sgWindow: 9 };
     const sensorColor = config.color || m.color;
 
     return (
@@ -3839,7 +3923,7 @@ export default function AranetUnifiedDashboard() {
             {/* Box 1: Analyseur Agronomique */}
             <div className="flex items-center bg-muted p-0.5 rounded-xl border">
               <button
-                onClick={() => setActiveTab("agronomic")}
+                onClick={() => requestTabChange("agronomic")}
                 className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
                   activeTab === "agronomic"
                     ? "bg-background text-foreground shadow-sm"
@@ -3855,6 +3939,10 @@ export default function AranetUnifiedDashboard() {
             <div className="flex items-center bg-muted p-0.5 rounded-xl border">
               <button
                 onClick={() => {
+                  if (activeTab === "selection" && hasUnsavedSelectionChanges) {
+                    setPendingTabSwitch("charts");
+                    return;
+                  }
                   setActiveTab("charts");
                   setStartDate(getPastDateStr(2));
                   setEndDate(getPastDateStr(1));
@@ -3868,7 +3956,7 @@ export default function AranetUnifiedDashboard() {
                 Climat/Croissance
               </button>
               <button
-                onClick={() => setActiveTab("fertigation")}
+                onClick={() => requestTabChange("fertigation")}
                 className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
                   activeTab === "fertigation"
                     ? "bg-background text-foreground shadow-sm"
@@ -3882,7 +3970,7 @@ export default function AranetUnifiedDashboard() {
             {/* Box: Mouvements de Poids (isolated so it never crowds the main chart) */}
             <div className="flex items-center bg-muted p-0.5 rounded-xl border">
               <button
-                onClick={() => setActiveTab("chutes")}
+                onClick={() => requestTabChange("chutes")}
                 className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
                   activeTab === "chutes"
                     ? "bg-background text-foreground shadow-sm"
@@ -5224,12 +5312,45 @@ export default function AranetUnifiedDashboard() {
               <div className="flex-1 overflow-y-auto bg-muted/10 p-6 md:p-10 max-h-[calc(100vh-3.5rem)] space-y-6">
                 <Card className="border-none shadow-md bg-background rounded-3xl overflow-hidden">
                   <CardHeader className="p-6 border-b bg-muted/10">
-                    <CardTitle className="text-lg font-black uppercase tracking-tight flex items-center gap-2">
-                      <Sliders className="h-5 w-5 text-primary animate-pulse" /> Configuration & Sélection des Capteurs
-                    </CardTitle>
-                    <CardDescription className="text-xs">
-                      Pour chaque capteur, cochez CLIMAT et/ou FERTI selon le(s) graphique(s) où il doit apparaître (aucun capteur redondant entre les deux), et ajustez ses options d&apos;axes et de lissage.
-                    </CardDescription>
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div>
+                        <CardTitle className="text-lg font-black uppercase tracking-tight flex items-center gap-2">
+                          <Sliders className="h-5 w-5 text-primary animate-pulse" /> Configuration & Sélection des Capteurs
+                        </CardTitle>
+                        <CardDescription className="text-xs mt-1">
+                          Pour chaque capteur, cochez CLIMAT et/ou FERTI selon le(s) graphique(s) où il doit apparaître (aucun capteur redondant entre les deux), et ajustez ses options d&apos;axes et de lissage. Rien n&apos;est appliqué tant que vous n&apos;avez pas cliqué sur Enregistrer.
+                        </CardDescription>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {hasUnsavedSelectionChanges && (
+                          <>
+                            <span className="text-[9px] font-bold text-amber-500 flex items-center animate-pulse mr-1">
+                              ⚠️ Non enregistré
+                            </span>
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              onClick={handleDiscardSelection}
+                              className="font-black text-[10px] uppercase px-3 py-1 rounded-lg"
+                            >
+                              Annuler
+                            </Button>
+                          </>
+                        )}
+                        <Button
+                          size="xs"
+                          disabled={!hasUnsavedSelectionChanges}
+                          onClick={handleSaveSelection}
+                          className={`font-black text-[10px] uppercase px-3 py-1 rounded-lg transition-all shadow-sm ${
+                            hasUnsavedSelectionChanges
+                              ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                              : "bg-slate-100 dark:bg-slate-800 text-muted-foreground border cursor-not-allowed"
+                          }`}
+                        >
+                          💾 Enregistrer la sélection
+                        </Button>
+                      </div>
+                    </div>
                   </CardHeader>
                   <CardContent className="p-6 space-y-8">
                     
@@ -5355,7 +5476,7 @@ export default function AranetUnifiedDashboard() {
                             <span>Sélectionnés (Climat et/ou Ferti) ({visibleMetrics.length})</span>
                             {visibleMetrics.length > 0 && (
                               <button
-                                onClick={() => { setSelectedKeys([]); setFertiSelectedKeys([]); }}
+                                onClick={() => { setSelectedKeysDraft([]); setFertiSelectedKeysDraft([]); }}
                                 className="text-[10px] text-muted-foreground hover:text-primary font-bold transition-colors cursor-pointer"
                               >
                                 Tout effacer
@@ -5998,6 +6119,54 @@ export default function AranetUnifiedDashboard() {
           </>
         );
       })()}
+
+      {/* Confirmation modal - leaving "Sélection des données" in-app with unsaved changes.
+          beforeunload (above) only covers actually closing/refreshing the tab, not switching
+          tabs within the app, which is a plain state change. */}
+      {pendingTabSwitch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+          <Card className="w-full max-w-sm border shadow-2xl bg-background rounded-3xl overflow-hidden animate-in zoom-in-95 duration-200">
+            <CardHeader className="p-5 border-b bg-muted/20">
+              <CardTitle className="text-xs font-black uppercase tracking-wider text-amber-600 flex items-center gap-2">
+                <AlertTriangle className="h-4.5 w-4.5" /> Modifications non enregistrées
+              </CardTitle>
+              <CardDescription className="text-[10px] font-bold">
+                Vous avez des changements non enregistrés dans la Sélection des données. Voulez-vous les enregistrer avant de continuer ?
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="p-5 flex flex-col gap-2">
+              <Button
+                onClick={() => {
+                  handleSaveSelection();
+                  setActiveTab(pendingTabSwitch);
+                  setPendingTabSwitch(null);
+                }}
+                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs uppercase rounded-xl h-10"
+              >
+                💾 Enregistrer et continuer
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  handleDiscardSelection();
+                  setActiveTab(pendingTabSwitch);
+                  setPendingTabSwitch(null);
+                }}
+                className="w-full font-black text-xs uppercase rounded-xl h-10"
+              >
+                Ignorer les changements
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => setPendingTabSwitch(null)}
+                className="w-full font-bold text-xs uppercase rounded-xl h-10 text-muted-foreground"
+              >
+                Annuler
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
