@@ -4827,21 +4827,6 @@ export default function AranetUnifiedDashboard() {
                               <b>IVL</b> (axe droit, %) mesure la qualité du pilotage climatique (température + CO2) indépendamment de la lumière disponible à l&apos;instant T - un IVL bas signale un potentiel lumineux gaspillé par un climat mal réglé.{" "}
                               <b>Croissance en direct</b> (axe droit extérieur, -100% à +100%) lisse le gain cumulé sur une fenêtre glissante de 15 minutes et l&apos;exprime en écart par rapport au rythme moyen de la journée (0% = rythme moyen du jour, +100% = deux fois plus vite que la moyenne, -100% = croissance à l&apos;arrêt sur cette fenêtre). Translucidité du verre utilisée : {glassTranslucidityPercent !== "" ? `${glassTranslucidityPercent}%` : "70% (valeur par défaut)"}.
                             </p>
-                            {/* Temporary diagnostic - Aréel/IVL reportedly not showing despite CO2/radiation/temp
-                                all being tagged with plausible values; this exposes resolved sensor keys and value
-                                ranges directly in the UI so the root cause can be read off a screenshot instead of
-                                guessed at blind. Remove once the underlying issue is confirmed fixed. */}
-                            {(() => {
-                              const aReelVals = photosynthesisChartData.map((r: any) => r.aReel).filter((v: any) => v !== null && v !== undefined);
-                              const ivlVals = photosynthesisChartData.map((r: any) => r.ivl).filter((v: any) => v !== null && v !== undefined);
-                              const nonZeroAReel = aReelVals.filter((v: number) => v > 0).length;
-                              const nonZeroIvl = ivlVals.filter((v: number) => v > 0).length;
-                              return (
-                                <p className="text-[9px] text-rose-500 font-mono mt-2 pt-2 border-t border-dashed border-muted-foreground/20">
-                                  [diag] co2Key={co2Key} radKey={radKey} tempKey={tempKey} | lignes={photosynthesisChartData.length} | Aréel non-null={aReelVals.length} (dont &gt;0: {nonZeroAReel}, min={aReelVals.length ? Math.min(...aReelVals).toFixed(2) : "-"}, max={aReelVals.length ? Math.max(...aReelVals).toFixed(2) : "-"}) | IVL non-null={ivlVals.length} (dont &gt;0: {nonZeroIvl}, min={ivlVals.length ? Math.min(...ivlVals).toFixed(1) : "-"}, max={ivlVals.length ? Math.max(...ivlVals).toFixed(1) : "-"})
-                                </p>
-                              );
-                            })()}
                           </div>
 
                           <Card className="flex-1 flex flex-col bg-background border border-muted/20 shadow-sm overflow-hidden min-h-[400px]">
