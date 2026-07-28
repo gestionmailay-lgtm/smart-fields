@@ -2623,7 +2623,14 @@ export default function AranetUnifiedDashboard() {
         const growthRatePercent = growthRateByTime.get(row.time) ?? null;
 
         if (isNaN(co2) || isNaN(rExt) || isNaN(temp)) {
-          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: null, ivl: null, growthRatePercent };
+          // At night, sensors (CO2 in particular) commonly go quiet - a real gap, not a missing
+          // reading, so it reads as a flat 0 (no photosynthesis) rather than null. Nulling it would
+          // make connectNulls bridge a diagonal line straight across the whole night, implying a
+          // gradual transition that never happened. Outside night hours a NaN is a genuine gap
+          // and stays null.
+          const hour = new Date(row.time).getHours();
+          const isNight = hour >= 20 || hour < 6;
+          return { time: row.time, formattedTime: row.formattedTime, formattedDate: row.formattedDate, aReel: isNight ? 0 : null, ivl: isNight ? 0 : null, growthRatePercent };
         }
 
         if (co2 <= 90) {
@@ -2648,6 +2655,30 @@ export default function AranetUnifiedDashboard() {
       })
       .sort((a, b) => a.time - b.time);
   }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
+
+  // One shaded band per night (20h-6h) spanned by the chart's time range, so the flattened-to-0
+  // stretches above read as "no measurement expected" rather than a real, unexplained dip to 0.
+  const photosynthesisNightBands = useMemo(() => {
+    if (photosynthesisChartData.length === 0) return [];
+    const times = photosynthesisChartData.map((r: any) => r.time);
+    const minT = Math.min(...times);
+    const maxT = Math.max(...times);
+    const bands: { x1: number; x2: number }[] = [];
+    const cursor = new Date(minT);
+    cursor.setHours(0, 0, 0, 0);
+    while (cursor.getTime() <= maxT) {
+      const nightStart = new Date(cursor);
+      nightStart.setHours(20, 0, 0, 0);
+      const nightEnd = new Date(cursor);
+      nightEnd.setDate(nightEnd.getDate() + 1);
+      nightEnd.setHours(6, 0, 0, 0);
+      if (nightEnd.getTime() >= minT && nightStart.getTime() <= maxT) {
+        bands.push({ x1: nightStart.getTime(), x2: nightEnd.getTime() });
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return bands;
+  }, [photosynthesisChartData]);
 
   // Optional Savitzky-Golay smoothing on "Croissance en direct" specifically - the raw rolling
   // rate is already 15-minute-windowed but still jumpy point to point, and unlike a real sensor
@@ -4676,6 +4707,18 @@ export default function AranetUnifiedDashboard() {
                                 <ResponsiveContainer width="100%" height="100%">
                                   <LineChart data={smoothedPhotosynthesisChartData} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
                                     <CartesianGrid yAxisId="left" strokeDasharray="3 3" vertical={false} stroke="#cbd5e1" />
+                                    {photosynthesisNightBands.map((band, idx) => (
+                                      <ReferenceArea
+                                        key={`night-band-${idx}`}
+                                        yAxisId="left"
+                                        x1={band.x1}
+                                        x2={band.x2}
+                                        fill="#64748b"
+                                        fillOpacity={0.1}
+                                        strokeOpacity={0}
+                                        ifOverflow="hidden"
+                                      />
+                                    ))}
                                     <ReferenceArea yAxisId="right" y1={0} y2={70} fill="#ef4444" fillOpacity={0.08} strokeOpacity={0} />
                                     <ReferenceArea yAxisId="right" y1={70} y2={90} fill="#f59e0b" fillOpacity={0.08} strokeOpacity={0} />
                                     <ReferenceArea yAxisId="right" y1={90} y2={100} fill="#22c55e" fillOpacity={0.1} strokeOpacity={0} />
