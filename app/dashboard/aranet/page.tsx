@@ -2451,32 +2451,14 @@ export default function AranetUnifiedDashboard() {
     };
   }, [fertiSelectedKeys, fertiStartDate, fertiEndDate]);
 
-  // Bin ferti readings per sensor, aligned to fertiTimeStep (same align-to-step approach as
-  // buildChartRows for the main chart) so the "Intervalle" selector in the banner has an effect.
-  const fertiChartData = useMemo(() => {
-    if (Object.keys(fertiRawDataMap).length === 0) return [];
-    const step = fertiTimeStep === "auto" ? 1 : Number(fertiTimeStep);
-    const bins: { [timeMs: number]: any } = {};
-    fertiSelectedKeys.forEach(key => {
-      const readings = (fertiRawDataMap[key] || []).filter((r: any) => r && r.value !== null && r.value !== undefined && !isNaN(Number(r.value)));
-      readings.forEach((r: any) => {
-        const date = new Date(r.time);
-        if (isNaN(date.getTime())) return;
-        const mins = date.getMinutes();
-        const binnedMins = Math.round(mins / step) * step;
-        date.setMinutes(binnedMins, 0, 0);
-        const timeMs = date.getTime();
-        if (!bins[timeMs]) {
-          bins[timeMs] = {
-            time: timeMs,
-            formattedTime: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          };
-        }
-        bins[timeMs][key] = Number(r.value);
-      });
-    });
-    return Object.values(bins).sort((a: any, b: any) => a.time - b.time);
-  }, [fertiRawDataMap, fertiSelectedKeys, fertiTimeStep]);
+  // Delegate to buildChartRows (same pipeline as the Climat/Croissance chart) rather than a plain
+  // per-key binning, so "plant_weight_gain" here goes through the exact same weight-movement
+  // detection/correction as everywhere else - a raw bin of the scale sensor would plot the
+  // uncorrected absolute weight instead of the corrected cumulative gain.
+  const fertiChartData = useMemo(
+    () => buildChartRows(fertiRawDataMap, fertiSelectedKeys, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, manualDrops, fertiTimeStep),
+    [fertiRawDataMap, fertiSelectedKeys, fertiTimeStep, metricConfigs, plantsOnScale, densityPerM2, dailyEvents, dailyAdjustedWeights, manualDrops]
+  );
 
   // Same per-minute binning, but over the Analyseur Agronomique tab's own date range, so the
   // advanced analysis can factor in irrigation/substrate conditions (VWC, EC, slab/plant weight)
