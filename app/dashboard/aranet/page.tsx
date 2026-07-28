@@ -45,7 +45,9 @@ import {
   Brush,
   ResponsiveContainer,
   ReferenceLine,
-  ReferenceArea
+  ReferenceArea,
+  ScatterChart,
+  Scatter
 } from "recharts";
 
 // Definition of all 20 plottable metrics with their available units
@@ -2559,6 +2561,25 @@ export default function AranetUnifiedDashboard() {
   const co2Key = resolveClimateKey(["co2"], k => k.toLowerCase().includes("co2"));
   const radKey = resolveClimateKey(["radiation_instant"], k => k.toLowerCase().includes("irr_out") || k.toLowerCase().includes("radiation") || k.toLowerCase().includes("solar") || k.toLowerCase().includes("rayonnement"));
   const tempKey = resolveClimateKey(["temp_serre"], k => k.toLowerCase().includes("temp") && !k.toLowerCase().includes("out") && !k.toLowerCase().includes("target") && !k.toLowerCase().includes("water"));
+  // VPD isn't tagged/available in every greenhouse (not every grower has a VPD probe) - prefer a
+  // measured sensor when tagged "vpd_haut", otherwise fall back to computing it from temp/RH via
+  // the standard Magnus-Tetens approximation, so the sensitivity analysis below always has a value.
+  const rhKey = resolveClimateKey(["hr_serre"], k => (k.toLowerCase().includes("rh") || k.toLowerCase().includes("humidity") || k.toLowerCase().includes("hum_measured")) && !k.toLowerCase().includes("out"));
+  const vpdSensorKey = resolveClimateKey(["vpd_haut"], k => k.toLowerCase().includes("vpd"));
+
+  const resolveVpdKpa = (row: any): number | null => {
+    if (vpdSensorKey && row[vpdSensorKey] !== undefined && row[vpdSensorKey] !== null && !isNaN(Number(row[vpdSensorKey]))) {
+      return Number(row[vpdSensorKey]);
+    }
+    if (tempKey && rhKey && row[tempKey] !== undefined && row[rhKey] !== undefined) {
+      const t = Number(row[tempKey]);
+      const rh = Number(row[rhKey]);
+      if (!isNaN(t) && !isNaN(rh)) {
+        return 0.611 * Math.exp((17.502 * t) / (t + 240.97)) * (1 - rh / 100);
+      }
+    }
+    return null;
+  };
 
   // "Croissance en direct" - a rolling 15-minute gain rate expressed as a % deviation from that
   // calendar day's own average rate, so the curve reads growth speed right now rather than an
@@ -2655,6 +2676,54 @@ export default function AranetUnifiedDashboard() {
       })
       .sort((a, b) => a.time - b.time);
   }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
+
+  // Empirical VPD sensitivity of growth: a simple ordinary-least-squares regression of
+  // "Croissance en direct" (growthRateByTime, already corrected for weight-drop artifacts) against
+  // VPD, restricted to daytime (6h-20h) since night growth is flattened to 0 regardless of VPD and
+  // would just bias the slope toward "no effect" without being a real physiological response.
+  // The slope (%/kPa) is the closest empirical proxy we have to a per-variety stomatal-sensitivity
+  // coefficient: near 0 = growth keeps going in dry air (drought-tolerant stomata, e.g. Jinpeng in
+  // Ding et al. 2022), steeply negative = growth collapses as VPD rises (sensitive stomata, e.g.
+  // Zhongza). This is a first-pass univariate fit - light and CO2 both covary with VPD across the
+  // day (all rise together as the sun comes up), so the slope partly reflects those too, not VPD
+  // in isolation; a cleaner read would control for PAR/CO2 in a multivariate fit.
+  const vpdSensitivity = useMemo(() => {
+    const points: { vpd: number; growth: number }[] = [];
+    chartData.forEach((row: any) => {
+      const growth = growthRateByTime.get(row.time);
+      if (growth === null || growth === undefined) return;
+      const hour = new Date(row.time).getHours();
+      if (hour < 6 || hour >= 20) return;
+      const vpd = resolveVpdKpa(row);
+      if (vpd === null || isNaN(vpd)) return;
+      points.push({ vpd: Number(vpd.toFixed(3)), growth });
+    });
+
+    if (points.length < 20) {
+      return { points, slope: null, intercept: null, r2: null, usedSensor: !!vpdSensorKey };
+    }
+
+    const n = points.length;
+    const meanX = points.reduce((s, p) => s + p.vpd, 0) / n;
+    const meanY = points.reduce((s, p) => s + p.growth, 0) / n;
+    let num = 0, den = 0;
+    points.forEach(p => {
+      num += (p.vpd - meanX) * (p.growth - meanY);
+      den += (p.vpd - meanX) ** 2;
+    });
+    const slope = den !== 0 ? num / den : 0;
+    const intercept = meanY - slope * meanX;
+
+    let ssRes = 0, ssTot = 0;
+    points.forEach(p => {
+      const pred = intercept + slope * p.vpd;
+      ssRes += (p.growth - pred) ** 2;
+      ssTot += (p.growth - meanY) ** 2;
+    });
+    const r2 = ssTot !== 0 ? 1 - ssRes / ssTot : 0;
+
+    return { points, slope: Number(slope.toFixed(2)), intercept: Number(intercept.toFixed(2)), r2: Number(r2.toFixed(3)), usedSensor: !!vpdSensorKey };
+  }, [chartData, growthRateByTime, tempKey, rhKey, vpdSensorKey]);
 
   // One shaded band per night (20h-6h) spanned by the chart's time range, so the flattened-to-0
   // stretches above read as "no measurement expected" rather than a real, unexplained dip to 0.
@@ -4797,6 +4866,91 @@ export default function AranetUnifiedDashboard() {
                                   </LineChart>
                                 </ResponsiveContainer>
                               </div>
+                            </CardContent>
+                          </Card>
+
+                          {/* Empirical VPD sensitivity - see vpdSensitivity above for the method/caveats
+                              (univariate OLS, daytime only, doesn't control for PAR/CO2 covarying with VPD). */}
+                          <Card className="bg-background border border-muted/20 shadow-sm overflow-hidden">
+                            <CardHeader className="p-4 border-b bg-muted/5">
+                              <CardTitle className="text-xs font-black uppercase tracking-tight flex items-center gap-2">
+                                <Droplets className="h-4 w-4 text-primary" /> Sensibilité au VPD (Coefficient de Croissance)
+                              </CardTitle>
+                              <p className="text-[9px] text-muted-foreground font-medium mt-0.5">
+                                Régression Croissance en direct (%) vs VPD (kPa), journée uniquement (6h-20h){vpdSensitivity.usedSensor ? " - VPD mesuré" : " - VPD calculé (T°/HR, aucun capteur VPD taggé)"}.
+                                Indicatif : ne contrôle pas encore la lumière/CO2, qui covarient avec le VPD au fil de la journée.
+                              </p>
+                            </CardHeader>
+                            <CardContent className="p-4">
+                              {vpdSensitivity.slope === null ? (
+                                <p className="text-xs text-muted-foreground text-center py-8">
+                                  Pas assez de points jour valides (CO2/Radiation/Température et VPD ou T°+HR) sur la période pour calculer une régression.
+                                </p>
+                              ) : (
+                                <>
+                                  <div className="flex flex-wrap items-center gap-4 mb-3">
+                                    <div className="text-center">
+                                      <p className="text-[9px] text-muted-foreground font-bold uppercase">Coefficient</p>
+                                      <p className={`text-lg font-black ${vpdSensitivity.slope >= -5 ? "text-emerald-600" : vpdSensitivity.slope <= -20 ? "text-rose-600" : "text-amber-600"}`}>
+                                        {vpdSensitivity.slope > 0 ? "+" : ""}{vpdSensitivity.slope} %/kPa
+                                      </p>
+                                    </div>
+                                    <div className="text-center">
+                                      <p className="text-[9px] text-muted-foreground font-bold uppercase">R²</p>
+                                      <p className="text-lg font-black text-foreground">{vpdSensitivity.r2}</p>
+                                    </div>
+                                    <div className="text-center">
+                                      <p className="text-[9px] text-muted-foreground font-bold uppercase">Points</p>
+                                      <p className="text-lg font-black text-foreground">{vpdSensitivity.points.length}</p>
+                                    </div>
+                                    <p className="text-[11px] font-bold flex-1 min-w-[200px]">
+                                      {vpdSensitivity.slope >= -5
+                                        ? "Croissance peu affectée par l'air sec - variété/conduite tolérante au VPD."
+                                        : vpdSensitivity.slope <= -20
+                                        ? "Croissance chute fortement quand le VPD monte - fermeture stomatique marquée, sensible à l'air sec."
+                                        : "Sensibilité modérée au VPD."}
+                                    </p>
+                                  </div>
+                                  <div className="w-full h-[260px]">
+                                    <ResponsiveContainer width="100%" height="100%">
+                                      <ScatterChart margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" />
+                                        <XAxis
+                                          dataKey="vpd"
+                                          type="number"
+                                          name="VPD"
+                                          unit=" kPa"
+                                          tick={{ fontSize: 8, fill: "#64748b", fontWeight: "600" }}
+                                          label={{ value: "VPD (kPa)", position: "insideBottom", offset: -3, style: { fontSize: 8, fontWeight: "bold", fill: "#64748b" } }}
+                                        />
+                                        <YAxis
+                                          dataKey="growth"
+                                          type="number"
+                                          name="Croissance"
+                                          unit="%"
+                                          tick={{ fontSize: 8, fill: "#16a34a" }}
+                                          label={{ value: "Croissance en direct (%)", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fontSize: 8, fontWeight: "bold", fill: "#16a34a" } }}
+                                        />
+                                        <Tooltip
+                                          formatter={(value: any, name: any) => [`${value}${name === "Croissance" ? "%" : " kPa"}`, name]}
+                                          contentStyle={{ fontSize: 11 }}
+                                        />
+                                        <Scatter data={vpdSensitivity.points.map(p => ({ vpd: p.vpd, growth: p.growth }))} fill="#0ea5e9" fillOpacity={0.35} isAnimationActive={false} />
+                                        {vpdSensitivity.slope !== null && vpdSensitivity.points.length > 0 && (() => {
+                                          const xs = vpdSensitivity.points.map(p => p.vpd);
+                                          const xMin = Math.min(...xs);
+                                          const xMax = Math.max(...xs);
+                                          const lineData = [
+                                            { vpd: xMin, growth: vpdSensitivity.intercept! + vpdSensitivity.slope! * xMin },
+                                            { vpd: xMax, growth: vpdSensitivity.intercept! + vpdSensitivity.slope! * xMax }
+                                          ];
+                                          return <Scatter data={lineData} line={{ stroke: "#dc2626", strokeWidth: 2 }} shape={() => <></>} legendType="none" isAnimationActive={false} />;
+                                        })()}
+                                      </ScatterChart>
+                                    </ResponsiveContainer>
+                                  </div>
+                                </>
+                              )}
                             </CardContent>
                           </Card>
                         </>
