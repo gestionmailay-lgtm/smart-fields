@@ -2733,8 +2733,9 @@ export default function AranetUnifiedDashboard() {
   }, [photosynthesisChartData, growthRateSmooth, growthRateSgWindow]);
 
   // Empirical VPD sensitivity of growth: a multiple OLS regression of "Croissance en direct"
-  // against VPD + PAR (rExt) + CO2 together, restricted to daytime (6h-20h) since night growth is
-  // flattened to 0 regardless of VPD and would just bias every slope toward "no effect". Fit on the
+  // against VPD + PAR (rExt) + CO2 together, restricted to points where PAR > 0 (real daylight,
+  // not a fixed 6h-20h window) since night growth is flattened to 0 regardless of VPD and would
+  // just bias every slope toward "no effect". Fit on the
   // smoothed curve (smoothedPhotosynthesisChartData, Savitzky-Golay at growthRateSgWindow, 45pts by
   // default) rather than the raw per-point rate, since the raw rate is still jumpy point to point
   // and would inject noise into the regression that has nothing to do with VPD. Light and CO2 both
@@ -2755,11 +2756,13 @@ export default function AranetUnifiedDashboard() {
     chartData.forEach((row: any) => {
       const growth = smoothedGrowthByTime.get(row.time);
       if (growth === null || growth === undefined) return;
-      const hour = new Date(row.time).getHours();
-      if (hour < 6 || hour >= 20) return;
+      const par = radKey && row[radKey] !== undefined && !isNaN(Number(row[radKey])) ? Number(row[radKey]) : null;
+      // "Daytime" is defined by actual measured light, not a fixed clock window - a fixed 6h-20h
+      // cutoff would wrongly include a cloudy/dark stretch inside that window (no photosynthesis
+      // driver despite the clock saying "day") and exclude a bright early/late-summer hour outside it.
+      if (par === null || par <= 0) return;
       const vpd = resolveVpdKpa(row);
       if (vpd === null || isNaN(vpd)) return;
-      const par = radKey && row[radKey] !== undefined && !isNaN(Number(row[radKey])) ? Number(row[radKey]) : null;
       const co2 = co2Key && row[co2Key] !== undefined && !isNaN(Number(row[co2Key])) ? Number(row[co2Key]) : null;
       points.push({ vpd: Number(vpd.toFixed(3)), par, co2, growth });
     });
@@ -4966,8 +4969,8 @@ export default function AranetUnifiedDashboard() {
                               </CardTitle>
                               <p className="text-[9px] text-muted-foreground font-medium mt-0.5">
                                 {vpdSensitivity.multivariate
-                                  ? "Régression multivariée Croissance en direct (%) ~ VPD + PAR + CO2, journée uniquement (6h-20h) - coefficient VPD isolé de la lumière/CO2."
-                                  : "Régression Croissance en direct (%) vs VPD (kPa) seul, journée uniquement (6h-20h) - PAR/CO2 indisponibles pour isoler leur effet."}
+                                  ? "Régression multivariée Croissance en direct (%) ~ VPD + PAR + CO2, sur les points où la lumière (PAR) est différente de 0 - coefficient VPD isolé de la lumière/CO2."
+                                  : "Régression Croissance en direct (%) vs VPD (kPa) seul, sur les points où la lumière (PAR) est différente de 0 - CO2 indisponible pour isoler son effet."}
                                 {vpdSensitivity.usedSensor ? " VPD mesuré." : " VPD calculé (T°/HR, aucun capteur VPD taggé)."}
                               </p>
                             </CardHeader>
