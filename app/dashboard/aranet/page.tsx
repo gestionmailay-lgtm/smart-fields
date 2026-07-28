@@ -2709,21 +2709,51 @@ export default function AranetUnifiedDashboard() {
       .sort((a, b) => a.time - b.time);
   }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
 
+  // Savitzky-Golay smoothing on "Croissance en direct" - on by default at a wide 45-point window
+  // (the raw rolling rate is 15-minute-windowed already but still jumpy point to point), and unlike
+  // a real sensor this synthetic series has no metricConfigs entry of its own, so its own small
+  // enable/window-size state lives here rather than piggybacking on updateMetricConfig.
+  const [growthRateSmooth, setGrowthRateSmooth] = useState(true);
+  const [growthRateSgWindow, setGrowthRateSgWindow] = useState(45);
+  const smoothedPhotosynthesisChartData = useMemo(() => {
+    if (!growthRateSmooth) return photosynthesisChartData;
+    // Same "filter nulls, smooth the contiguous run, map back by time" pattern used for real
+    // sensors in buildChartRows - a Savitzky-Golay window can't cross over a gap meaningfully.
+    const withValue = photosynthesisChartData.filter((r: any) => r.growthRatePercent !== null && r.growthRatePercent !== undefined);
+    if (withValue.length === 0) return photosynthesisChartData;
+    let windowSize = growthRateSgWindow;
+    if (windowSize % 2 === 0) windowSize += 1;
+    const smoothedValues = applySavitzkyGolay(withValue.map((r: any) => r.growthRatePercent), windowSize, 2);
+    const smoothedByTime = new Map<number, number>();
+    withValue.forEach((r: any, idx: number) => smoothedByTime.set(r.time, Number(smoothedValues[idx].toFixed(1))));
+    return photosynthesisChartData.map((r: any) => ({
+      ...r,
+      growthRatePercent: smoothedByTime.has(r.time) ? smoothedByTime.get(r.time) : r.growthRatePercent
+    }));
+  }, [photosynthesisChartData, growthRateSmooth, growthRateSgWindow]);
+
   // Empirical VPD sensitivity of growth: a multiple OLS regression of "Croissance en direct"
-  // (growthRateByTime, already corrected for weight-drop artifacts) against VPD + PAR (rExt) + CO2
-  // together, restricted to daytime (6h-20h) since night growth is flattened to 0 regardless of
-  // VPD and would just bias every slope toward "no effect". Light and CO2 both covary with VPD
-  // across the day (all rise together as the sun comes up), so a univariate VPD-only slope would
-  // partly capture their effect too - controlling for them here isolates the VPD-specific
-  // coefficient (bVpd, %/kPa), our proxy for per-variety/per-greenhouse stomatal sensitivity: near
-  // 0 = growth keeps going in dry air (drought-tolerant stomata, e.g. Jinpeng in Ding et al. 2022),
-  // steeply negative = growth collapses as VPD rises (sensitive stomata, e.g. Zhongza).
-  // Falls back to a plain univariate VPD-only fit when PAR/CO2 aren't both available.
+  // against VPD + PAR (rExt) + CO2 together, restricted to daytime (6h-20h) since night growth is
+  // flattened to 0 regardless of VPD and would just bias every slope toward "no effect". Fit on the
+  // smoothed curve (smoothedPhotosynthesisChartData, Savitzky-Golay at growthRateSgWindow, 45pts by
+  // default) rather than the raw per-point rate, since the raw rate is still jumpy point to point
+  // and would inject noise into the regression that has nothing to do with VPD. Light and CO2 both
+  // covary with VPD across the day (all rise together as the sun comes up), so a univariate
+  // VPD-only slope would partly capture their effect too - controlling for them here isolates the
+  // VPD-specific coefficient (bVpd, %/kPa), our proxy for per-variety/per-greenhouse stomatal
+  // sensitivity: near 0 = growth keeps going in dry air (drought-tolerant stomata, e.g. Jinpeng in
+  // Ding et al. 2022), steeply negative = growth collapses as VPD rises (sensitive stomata, e.g.
+  // Zhongza). Falls back to a plain univariate VPD-only fit when PAR/CO2 aren't both available.
   const vpdSensitivity = useMemo(() => {
+    const smoothedGrowthByTime = new Map<number, number>();
+    smoothedPhotosynthesisChartData.forEach((r: any) => {
+      if (r.growthRatePercent !== null && r.growthRatePercent !== undefined) smoothedGrowthByTime.set(r.time, r.growthRatePercent);
+    });
+
     type Point = { vpd: number; par: number | null; co2: number | null; growth: number };
     const points: Point[] = [];
     chartData.forEach((row: any) => {
-      const growth = growthRateByTime.get(row.time);
+      const growth = smoothedGrowthByTime.get(row.time);
       if (growth === null || growth === undefined) return;
       const hour = new Date(row.time).getHours();
       if (hour < 6 || hour >= 20) return;
@@ -2801,7 +2831,7 @@ export default function AranetUnifiedDashboard() {
       chartPoints, slope: Number(bVpd.toFixed(2)), r2: Number(r2.toFixed(3)), n, multivariate: true,
       bPar: Number(bPar.toFixed(4)), bCo2: Number(bCo2.toFixed(4)), usedSensor: !!vpdSensorKey
     };
-  }, [chartData, growthRateByTime, tempKey, rhKey, vpdSensorKey, radKey, co2Key]);
+  }, [chartData, smoothedPhotosynthesisChartData, tempKey, rhKey, vpdSensorKey, radKey, co2Key]);
 
   // One shaded band per night (20h-6h) spanned by the chart's time range, so the flattened-to-0
   // stretches above read as "no measurement expected" rather than a real, unexplained dip to 0.
@@ -2826,29 +2856,6 @@ export default function AranetUnifiedDashboard() {
     }
     return bands;
   }, [photosynthesisChartData]);
-
-  // Optional Savitzky-Golay smoothing on "Croissance en direct" specifically - the raw rolling
-  // rate is already 15-minute-windowed but still jumpy point to point, and unlike a real sensor
-  // this synthetic series has no metricConfigs entry of its own, so its own small
-  // enable/window-size state lives here rather than piggybacking on updateMetricConfig.
-  const [growthRateSmooth, setGrowthRateSmooth] = useState(false);
-  const [growthRateSgWindow, setGrowthRateSgWindow] = useState(9);
-  const smoothedPhotosynthesisChartData = useMemo(() => {
-    if (!growthRateSmooth) return photosynthesisChartData;
-    // Same "filter nulls, smooth the contiguous run, map back by time" pattern used for real
-    // sensors in buildChartRows - a Savitzky-Golay window can't cross over a gap meaningfully.
-    const withValue = photosynthesisChartData.filter((r: any) => r.growthRatePercent !== null && r.growthRatePercent !== undefined);
-    if (withValue.length === 0) return photosynthesisChartData;
-    let windowSize = growthRateSgWindow;
-    if (windowSize % 2 === 0) windowSize += 1;
-    const smoothedValues = applySavitzkyGolay(withValue.map((r: any) => r.growthRatePercent), windowSize, 2);
-    const smoothedByTime = new Map<number, number>();
-    withValue.forEach((r: any, idx: number) => smoothedByTime.set(r.time, Number(smoothedValues[idx].toFixed(1))));
-    return photosynthesisChartData.map((r: any) => ({
-      ...r,
-      growthRatePercent: smoothedByTime.has(r.time) ? smoothedByTime.get(r.time) : r.growthRatePercent
-    }));
-  }, [photosynthesisChartData, growthRateSmooth, growthRateSgWindow]);
 
   // Analyseur Agronomique keeps its own date range (agroRawDataMap, fetched separately below)
   // so browsing a different period there never changes what the Climat/Croissance chart shows.
@@ -5042,7 +5049,7 @@ export default function AranetUnifiedDashboard() {
                                             { vpd: xMin, growth: meanY + vpdSensitivity.slope! * (xMin - meanX) },
                                             { vpd: xMax, growth: meanY + vpdSensitivity.slope! * (xMax - meanX) }
                                           ];
-                                          return <Scatter data={lineData} line={{ stroke: "#dc2626", strokeWidth: 2 }} shape={() => <></>} legendType="none" isAnimationActive={false} />;
+                                          return <Scatter data={lineData} line={{ stroke: "#dc2626", strokeWidth: 2 }} shape={() => null} legendType="none" isAnimationActive={false} />;
                                         })()}
                                       </ScatterChart>
                                     </ResponsiveContainer>
