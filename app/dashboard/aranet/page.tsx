@@ -413,6 +413,28 @@ function detectWeightMovements(
 // smoothing, and applies every validated weight-drop correction. Pulled out as a pure function so
 // both the Climat/Croissance chart and the Analyseur Agronomique tab (which keeps its own,
 // independent date range/rawDataMap) can share the exact same processing logic.
+// Small Gaussian-elimination solver (with partial pivoting) for the normal equations of an OLS
+// multiple regression (X^T X · beta = X^T y). Only ever called on tiny systems here (a handful of
+// predictors), so no need for a full linear-algebra dependency.
+function solveLinearSystem(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivotRow = col;
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(M[r][col]) > Math.abs(M[pivotRow][col])) pivotRow = r;
+    }
+    if (Math.abs(M[pivotRow][col]) < 1e-10) return null;
+    [M[col], M[pivotRow]] = [M[pivotRow], M[col]];
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col] / M[col][col];
+      for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
+}
+
 function buildChartRows(
   rawDataMap: { [key: string]: any[] },
   selectedKeys: string[],
@@ -2677,18 +2699,19 @@ export default function AranetUnifiedDashboard() {
       .sort((a, b) => a.time - b.time);
   }, [chartData, co2Key, radKey, tempKey, glassTranslucidityPercent, growthRateByTime]);
 
-  // Empirical VPD sensitivity of growth: a simple ordinary-least-squares regression of
-  // "Croissance en direct" (growthRateByTime, already corrected for weight-drop artifacts) against
-  // VPD, restricted to daytime (6h-20h) since night growth is flattened to 0 regardless of VPD and
-  // would just bias the slope toward "no effect" without being a real physiological response.
-  // The slope (%/kPa) is the closest empirical proxy we have to a per-variety stomatal-sensitivity
-  // coefficient: near 0 = growth keeps going in dry air (drought-tolerant stomata, e.g. Jinpeng in
-  // Ding et al. 2022), steeply negative = growth collapses as VPD rises (sensitive stomata, e.g.
-  // Zhongza). This is a first-pass univariate fit - light and CO2 both covary with VPD across the
-  // day (all rise together as the sun comes up), so the slope partly reflects those too, not VPD
-  // in isolation; a cleaner read would control for PAR/CO2 in a multivariate fit.
+  // Empirical VPD sensitivity of growth: a multiple OLS regression of "Croissance en direct"
+  // (growthRateByTime, already corrected for weight-drop artifacts) against VPD + PAR (rExt) + CO2
+  // together, restricted to daytime (6h-20h) since night growth is flattened to 0 regardless of
+  // VPD and would just bias every slope toward "no effect". Light and CO2 both covary with VPD
+  // across the day (all rise together as the sun comes up), so a univariate VPD-only slope would
+  // partly capture their effect too - controlling for them here isolates the VPD-specific
+  // coefficient (bVpd, %/kPa), our proxy for per-variety/per-greenhouse stomatal sensitivity: near
+  // 0 = growth keeps going in dry air (drought-tolerant stomata, e.g. Jinpeng in Ding et al. 2022),
+  // steeply negative = growth collapses as VPD rises (sensitive stomata, e.g. Zhongza).
+  // Falls back to a plain univariate VPD-only fit when PAR/CO2 aren't both available.
   const vpdSensitivity = useMemo(() => {
-    const points: { vpd: number; growth: number }[] = [];
+    type Point = { vpd: number; par: number | null; co2: number | null; growth: number };
+    const points: Point[] = [];
     chartData.forEach((row: any) => {
       const growth = growthRateByTime.get(row.time);
       if (growth === null || growth === undefined) return;
@@ -2696,34 +2719,79 @@ export default function AranetUnifiedDashboard() {
       if (hour < 6 || hour >= 20) return;
       const vpd = resolveVpdKpa(row);
       if (vpd === null || isNaN(vpd)) return;
-      points.push({ vpd: Number(vpd.toFixed(3)), growth });
+      const par = radKey && row[radKey] !== undefined && !isNaN(Number(row[radKey])) ? Number(row[radKey]) : null;
+      const co2 = co2Key && row[co2Key] !== undefined && !isNaN(Number(row[co2Key])) ? Number(row[co2Key]) : null;
+      points.push({ vpd: Number(vpd.toFixed(3)), par, co2, growth });
     });
 
-    if (points.length < 20) {
-      return { points, slope: null, intercept: null, r2: null, usedSensor: !!vpdSensorKey };
+    const controlled = points.filter(p => p.par !== null && p.co2 !== null);
+    const multivariate = controlled.length >= 20;
+    const usable = multivariate ? controlled : points;
+
+    if (usable.length < 20) {
+      return { chartPoints: [] as { vpd: number; growth: number }[], slope: null as number | null, r2: null as number | null, n: usable.length, multivariate: false, bPar: null as number | null, bCo2: null as number | null, usedSensor: !!vpdSensorKey };
     }
 
-    const n = points.length;
-    const meanX = points.reduce((s, p) => s + p.vpd, 0) / n;
-    const meanY = points.reduce((s, p) => s + p.growth, 0) / n;
-    let num = 0, den = 0;
-    points.forEach(p => {
-      num += (p.vpd - meanX) * (p.growth - meanY);
-      den += (p.vpd - meanX) ** 2;
-    });
-    const slope = den !== 0 ? num / den : 0;
-    const intercept = meanY - slope * meanX;
+    const n = usable.length;
+    const y = usable.map(p => p.growth);
+    const meanY = y.reduce((s, v) => s + v, 0) / n;
+
+    if (!multivariate) {
+      // Univariate fallback: plain least-squares slope of growth on VPD alone.
+      const meanX = usable.reduce((s, p) => s + p.vpd, 0) / n;
+      let num = 0, den = 0;
+      usable.forEach(p => { num += (p.vpd - meanX) * (p.growth - meanY); den += (p.vpd - meanX) ** 2; });
+      const slope = den !== 0 ? num / den : 0;
+      const intercept = meanY - slope * meanX;
+      let ssRes = 0, ssTot = 0;
+      usable.forEach(p => { const pred = intercept + slope * p.vpd; ssRes += (p.growth - pred) ** 2; ssTot += (p.growth - meanY) ** 2; });
+      const r2 = ssTot !== 0 ? 1 - ssRes / ssTot : 0;
+      return {
+        chartPoints: usable.map(p => ({ vpd: p.vpd, growth: p.growth })),
+        slope: Number(slope.toFixed(2)), r2: Number(r2.toFixed(3)), n, multivariate: false,
+        bPar: null, bCo2: null, usedSensor: !!vpdSensorKey
+      };
+    }
+
+    // Multivariate: [1, vpd, par, co2] -> growth
+    const X = usable.map(p => [1, p.vpd, p.par as number, p.co2 as number]);
+    const k = 4;
+    const XtX = Array.from({ length: k }, () => Array(k).fill(0));
+    const Xty = Array(k).fill(0);
+    for (let i = 0; i < n; i++) {
+      for (let a = 0; a < k; a++) {
+        Xty[a] += X[i][a] * y[i];
+        for (let b = 0; b < k; b++) XtX[a][b] += X[i][a] * X[i][b];
+      }
+    }
+    const beta = solveLinearSystem(XtX, Xty);
+    if (!beta) {
+      return { chartPoints: [] as { vpd: number; growth: number }[], slope: null, r2: null, n, multivariate: false, bPar: null, bCo2: null, usedSensor: !!vpdSensorKey };
+    }
+    const [intercept, bVpd, bPar, bCo2] = beta;
 
     let ssRes = 0, ssTot = 0;
-    points.forEach(p => {
-      const pred = intercept + slope * p.vpd;
+    usable.forEach(p => {
+      const pred = intercept + bVpd * p.vpd + bPar * (p.par as number) + bCo2 * (p.co2 as number);
       ssRes += (p.growth - pred) ** 2;
       ssTot += (p.growth - meanY) ** 2;
     });
     const r2 = ssTot !== 0 ? 1 - ssRes / ssTot : 0;
 
-    return { points, slope: Number(slope.toFixed(2)), intercept: Number(intercept.toFixed(2)), r2: Number(r2.toFixed(3)), usedSensor: !!vpdSensorKey };
-  }, [chartData, growthRateByTime, tempKey, rhKey, vpdSensorKey]);
+    // Partial-residual plot: strip out the PAR/CO2 contribution (relative to their sample means) so
+    // the scatter directly shows the VPD-isolated relationship, not one blurred by light/CO2 swings.
+    const meanPar = usable.reduce((s, p) => s + (p.par as number), 0) / n;
+    const meanCo2 = usable.reduce((s, p) => s + (p.co2 as number), 0) / n;
+    const chartPoints = usable.map(p => ({
+      vpd: p.vpd,
+      growth: Number((p.growth - bPar * ((p.par as number) - meanPar) - bCo2 * ((p.co2 as number) - meanCo2)).toFixed(2))
+    }));
+
+    return {
+      chartPoints, slope: Number(bVpd.toFixed(2)), r2: Number(r2.toFixed(3)), n, multivariate: true,
+      bPar: Number(bPar.toFixed(4)), bCo2: Number(bCo2.toFixed(4)), usedSensor: !!vpdSensorKey
+    };
+  }, [chartData, growthRateByTime, tempKey, rhKey, vpdSensorKey, radKey, co2Key]);
 
   // One shaded band per night (20h-6h) spanned by the chart's time range, so the flattened-to-0
   // stretches above read as "no measurement expected" rather than a real, unexplained dip to 0.
@@ -4869,39 +4937,55 @@ export default function AranetUnifiedDashboard() {
                             </CardContent>
                           </Card>
 
-                          {/* Empirical VPD sensitivity - see vpdSensitivity above for the method/caveats
-                              (univariate OLS, daytime only, doesn't control for PAR/CO2 covarying with VPD). */}
+                          {/* Empirical VPD sensitivity - see vpdSensitivity above for the method/caveats.
+                              Multivariate (VPD + PAR + CO2) when both are available, so the VPD
+                              coefficient is isolated from light/CO2 instead of blurred by them;
+                              falls back to a plain VPD-only fit otherwise. */}
                           <Card className="bg-background border border-muted/20 shadow-sm overflow-hidden">
                             <CardHeader className="p-4 border-b bg-muted/5">
                               <CardTitle className="text-xs font-black uppercase tracking-tight flex items-center gap-2">
                                 <Droplets className="h-4 w-4 text-primary" /> Sensibilité au VPD (Coefficient de Croissance)
                               </CardTitle>
                               <p className="text-[9px] text-muted-foreground font-medium mt-0.5">
-                                Régression Croissance en direct (%) vs VPD (kPa), journée uniquement (6h-20h){vpdSensitivity.usedSensor ? " - VPD mesuré" : " - VPD calculé (T°/HR, aucun capteur VPD taggé)"}.
-                                Indicatif : ne contrôle pas encore la lumière/CO2, qui covarient avec le VPD au fil de la journée.
+                                {vpdSensitivity.multivariate
+                                  ? "Régression multivariée Croissance en direct (%) ~ VPD + PAR + CO2, journée uniquement (6h-20h) - coefficient VPD isolé de la lumière/CO2."
+                                  : "Régression Croissance en direct (%) vs VPD (kPa) seul, journée uniquement (6h-20h) - PAR/CO2 indisponibles pour isoler leur effet."}
+                                {vpdSensitivity.usedSensor ? " VPD mesuré." : " VPD calculé (T°/HR, aucun capteur VPD taggé)."}
                               </p>
                             </CardHeader>
                             <CardContent className="p-4">
                               {vpdSensitivity.slope === null ? (
                                 <p className="text-xs text-muted-foreground text-center py-8">
-                                  Pas assez de points jour valides (CO2/Radiation/Température et VPD ou T°+HR) sur la période pour calculer une régression.
+                                  Pas assez de points jour valides (VPD, ou T°+HR de repli) sur la période pour calculer une régression.
                                 </p>
                               ) : (
                                 <>
                                   <div className="flex flex-wrap items-center gap-4 mb-3">
                                     <div className="text-center">
-                                      <p className="text-[9px] text-muted-foreground font-bold uppercase">Coefficient</p>
+                                      <p className="text-[9px] text-muted-foreground font-bold uppercase">Coeff. VPD</p>
                                       <p className={`text-lg font-black ${vpdSensitivity.slope >= -5 ? "text-emerald-600" : vpdSensitivity.slope <= -20 ? "text-rose-600" : "text-amber-600"}`}>
                                         {vpdSensitivity.slope > 0 ? "+" : ""}{vpdSensitivity.slope} %/kPa
                                       </p>
                                     </div>
+                                    {vpdSensitivity.multivariate && (
+                                      <>
+                                        <div className="text-center">
+                                          <p className="text-[9px] text-muted-foreground font-bold uppercase">Coeff. PAR</p>
+                                          <p className="text-sm font-black text-foreground">{vpdSensitivity.bPar}</p>
+                                        </div>
+                                        <div className="text-center">
+                                          <p className="text-[9px] text-muted-foreground font-bold uppercase">Coeff. CO2</p>
+                                          <p className="text-sm font-black text-foreground">{vpdSensitivity.bCo2}</p>
+                                        </div>
+                                      </>
+                                    )}
                                     <div className="text-center">
                                       <p className="text-[9px] text-muted-foreground font-bold uppercase">R²</p>
                                       <p className="text-lg font-black text-foreground">{vpdSensitivity.r2}</p>
                                     </div>
                                     <div className="text-center">
                                       <p className="text-[9px] text-muted-foreground font-bold uppercase">Points</p>
-                                      <p className="text-lg font-black text-foreground">{vpdSensitivity.points.length}</p>
+                                      <p className="text-lg font-black text-foreground">{vpdSensitivity.n}</p>
                                     </div>
                                     <p className="text-[11px] font-bold flex-1 min-w-[200px]">
                                       {vpdSensitivity.slope >= -5
@@ -4929,20 +5013,23 @@ export default function AranetUnifiedDashboard() {
                                           name="Croissance"
                                           unit="%"
                                           tick={{ fontSize: 8, fill: "#16a34a" }}
-                                          label={{ value: "Croissance en direct (%)", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fontSize: 8, fontWeight: "bold", fill: "#16a34a" } }}
+                                          label={{ value: vpdSensitivity.multivariate ? "Croissance ajustée (%)" : "Croissance en direct (%)", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fontSize: 8, fontWeight: "bold", fill: "#16a34a" } }}
                                         />
                                         <Tooltip
                                           formatter={(value: any, name: any) => [`${value}${name === "Croissance" ? "%" : " kPa"}`, name]}
                                           contentStyle={{ fontSize: 11 }}
                                         />
-                                        <Scatter data={vpdSensitivity.points.map(p => ({ vpd: p.vpd, growth: p.growth }))} fill="#0ea5e9" fillOpacity={0.35} isAnimationActive={false} />
-                                        {vpdSensitivity.slope !== null && vpdSensitivity.points.length > 0 && (() => {
-                                          const xs = vpdSensitivity.points.map(p => p.vpd);
+                                        <Scatter data={vpdSensitivity.chartPoints} fill="#0ea5e9" fillOpacity={0.35} isAnimationActive={false} />
+                                        {vpdSensitivity.slope !== null && vpdSensitivity.chartPoints.length > 0 && (() => {
+                                          const xs = vpdSensitivity.chartPoints.map(p => p.vpd);
+                                          const ys = vpdSensitivity.chartPoints.map(p => p.growth);
+                                          const meanX = xs.reduce((s, v) => s + v, 0) / xs.length;
+                                          const meanY = ys.reduce((s, v) => s + v, 0) / ys.length;
                                           const xMin = Math.min(...xs);
                                           const xMax = Math.max(...xs);
                                           const lineData = [
-                                            { vpd: xMin, growth: vpdSensitivity.intercept! + vpdSensitivity.slope! * xMin },
-                                            { vpd: xMax, growth: vpdSensitivity.intercept! + vpdSensitivity.slope! * xMax }
+                                            { vpd: xMin, growth: meanY + vpdSensitivity.slope! * (xMin - meanX) },
+                                            { vpd: xMax, growth: meanY + vpdSensitivity.slope! * (xMax - meanX) }
                                           ];
                                           return <Scatter data={lineData} line={{ stroke: "#dc2626", strokeWidth: 2 }} shape={() => <></>} legendType="none" isAnimationActive={false} />;
                                         })()}
