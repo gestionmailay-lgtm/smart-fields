@@ -12,7 +12,7 @@ export async function GET() {
     const supabase = createAdminClient();
     const { data, error } = await supabase
       .from("agro_greenhouse_settings")
-      .select("culture, culture_typology, glass_translucidity_percent")
+      .select("culture, culture_typology, culture_variety, glass_translucidity_percent")
       .eq("id", 1)
       .maybeSingle();
     if (error) throw error;
@@ -21,7 +21,7 @@ export async function GET() {
       const { data: created, error: insertError } = await supabase
         .from("agro_greenhouse_settings")
         .insert({ id: 1 })
-        .select("culture, culture_typology, glass_translucidity_percent")
+        .select("culture, culture_typology, culture_variety, glass_translucidity_percent")
         .single();
       if (insertError) throw insertError;
       return NextResponse.json({ settings: created });
@@ -37,9 +37,10 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   try {
     const body = await req.json();
-    const update: { culture?: string | null; culture_typology?: string | null; glass_translucidity_percent?: number | null } = {};
+    const update: { culture?: string | null; culture_typology?: string | null; culture_variety?: string | null; glass_translucidity_percent?: number | null } = {};
     if ("culture" in body) update.culture = body.culture ?? null;
     if ("cultureTypology" in body) update.culture_typology = body.cultureTypology ?? null;
+    if ("cultureVariety" in body) update.culture_variety = body.cultureVariety ?? null;
     if ("glassTranslucidityPercent" in body) {
       const v = body.glassTranslucidityPercent;
       update.glass_translucidity_percent = (v === null || v === undefined || v === "") ? null : Number(v);
@@ -52,7 +53,7 @@ export async function PATCH(req: NextRequest) {
     const { data, error } = await supabase
       .from("agro_greenhouse_settings")
       .upsert({ id: 1, ...update, updated_at: new Date().toISOString() }, { onConflict: "id" })
-      .select("culture, culture_typology, glass_translucidity_percent")
+      .select("culture, culture_typology, culture_variety, glass_translucidity_percent")
       .single();
     if (error) throw error;
 

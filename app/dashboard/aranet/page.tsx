@@ -67,6 +67,14 @@ const CULTURE_TYPOLOGIES: { [culture: string]: string[] } = {
   Concombre: []
 };
 
+// Variety within a typology - needed to eventually fit the VPD growth-sensitivity regression
+// (Efficience Photosynthétique tab) per variety instead of per greenhouse. Only one known variety
+// so far; extend as more growers/varieties are onboarded.
+const CULTURE_VARIETIES: { [culture: string]: string[] } = {
+  Tomate: ["Xenia XR"],
+  Concombre: []
+};
+
 const PLOTTABLE_METRICS = [
   { key: "temp_rh_top_1", name: "T/RH top - Temp", category: "Climat", metricId: "1", color: "#e11d48", sensorId: "1071787", units: [{ id: "1", name: "°C" }, { id: "101", name: "°F" }, { id: "102", name: "K" }, { id: "119", name: "Cel" }] },
   { key: "temp_rh_top_2", name: "T/RH top - Humidity", category: "Climat", metricId: "2", color: "#06b6d4", sensorId: "1071787", units: [{ id: "2", name: "%" }, { id: "120", name: "%RH" }] },
@@ -1230,9 +1238,10 @@ export default function AranetUnifiedDashboard() {
   // (debounced) on every change via /api/greenhouse-settings.
   const [greenhouseCulture, setGreenhouseCulture] = useState<string>("");
   const [greenhouseCultureTypology, setGreenhouseCultureTypology] = useState<string>("");
+  const [greenhouseCultureVariety, setGreenhouseCultureVariety] = useState<string>("Xenia XR");
   const [glassTranslucidityPercent, setGlassTranslucidityPercent] = useState<string>("");
   const greenhouseSettingsCommitTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const commitGreenhouseSettings = (update: { culture?: string; cultureTypology?: string; glassTranslucidityPercent?: string }) => {
+  const commitGreenhouseSettings = (update: { culture?: string; cultureTypology?: string; cultureVariety?: string; glassTranslucidityPercent?: string }) => {
     if (greenhouseSettingsCommitTimeoutRef.current) clearTimeout(greenhouseSettingsCommitTimeoutRef.current);
     greenhouseSettingsCommitTimeoutRef.current = setTimeout(() => {
       fetch("/api/greenhouse-settings", {
@@ -1249,6 +1258,7 @@ export default function AranetUnifiedDashboard() {
         if (!data?.settings) return;
         setGreenhouseCulture(data.settings.culture || "");
         setGreenhouseCultureTypology(data.settings.culture_typology || "");
+        setGreenhouseCultureVariety(data.settings.culture_variety || "Xenia XR");
         setGlassTranslucidityPercent(data.settings.glass_translucidity_percent !== null && data.settings.glass_translucidity_percent !== undefined ? String(data.settings.glass_translucidity_percent) : "");
       })
       .catch(e => console.error("Failed to load greenhouse settings:", e));
@@ -3730,6 +3740,7 @@ export default function AranetUnifiedDashboard() {
           ruleBasedFindings: d.aiContext?.ruleBasedFindings || [],
           culture: greenhouseCulture || null,
           cultureTypology: greenhouseCultureTypology || null,
+          cultureVariety: greenhouseCultureVariety || null,
           glassTranslucidityPercent: glassTranslucidityPercent !== "" ? Number(glassTranslucidityPercent) : null
         }));
       if (days.length === 0) return;
@@ -3742,7 +3753,7 @@ export default function AranetUnifiedDashboard() {
     return () => {
       if (agroSummarySyncTimeoutRef.current) clearTimeout(agroSummarySyncTimeoutRef.current);
     };
-  }, [agronomicDataWithBenchmark, isLoaded, greenhouseCulture, greenhouseCultureTypology, glassTranslucidityPercent]);
+  }, [agronomicDataWithBenchmark, isLoaded, greenhouseCulture, greenhouseCultureTypology, greenhouseCultureVariety, glassTranslucidityPercent]);
 
   const brushIndices = useMemo(() => {
     if (!zoomTimeRange || chartData.length === 0) {
@@ -6040,6 +6051,20 @@ export default function AranetUnifiedDashboard() {
                             >
                               <option value="">Sélectionner...</option>
                               {(CULTURE_TYPOLOGIES[greenhouseCulture] || []).map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-muted-foreground uppercase font-bold">Variété</label>
+                            <select
+                              value={greenhouseCultureVariety}
+                              onChange={(e) => {
+                                setGreenhouseCultureVariety(e.target.value);
+                                commitGreenhouseSettings({ cultureVariety: e.target.value });
+                              }}
+                              className="w-full text-xs border rounded-xl bg-background p-2 focus:outline-none focus:ring-1 focus:ring-primary font-bold cursor-pointer"
+                            >
+                              <option value="Xenia XR">Xenia XR</option>
+                              {(CULTURE_VARIETIES[greenhouseCulture] || []).filter(v => v !== "Xenia XR").map(v => <option key={v} value={v}>{v}</option>)}
                             </select>
                           </div>
                           <div className="space-y-1">

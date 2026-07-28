@@ -38,6 +38,7 @@ export async function POST(req: NextRequest) {
         rule_based_findings: d.ruleBasedFindings ?? [],
         culture: d.culture ?? null,
         culture_typology: d.cultureTypology ?? null,
+        culture_variety: d.cultureVariety ?? null,
         glass_translucidity_percent: d.glassTranslucidityPercent ?? null,
         updated_at: new Date().toISOString()
       }));
