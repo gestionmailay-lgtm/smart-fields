@@ -417,42 +417,6 @@ function detectWeightMovements(
   return movements;
 }
 
-// Resets a cumulative sensor's readings to 0 at every local midnight, the same way
-// plant_weight_gain does further up in fetchDataForRange: group by local calendar day, subtract
-// that day's first reading as a baseline. Used for any sensor tagged with the "radiation_sum"
-// agro role (a daily light/radiation sum, e.g. J/cm²) so the chart always restarts its climb from
-// 0 each day instead of drifting upward across a multi-day range if the source device (Aranet or
-// Priva) doesn't already reset it exactly at midnight itself.
-// clampToZero floors every result at 0 - needed for radiation_sum specifically, since it's a
-// physically non-decreasing daily total: sensor noise can make a later reading dip slightly below
-// the very first reading of the day, which would otherwise subtract into a negative "sum" that
-// can't exist in reality. plant_weight_gain deliberately keeps allowing negative values (a real
-// drop below the midnight baseline, e.g. a harvest, is a genuine signal there).
-function resetDailyBaseline(readings: any[], options?: { clampToZero?: boolean }): any[] {
-  const clampToZero = options?.clampToZero ?? false;
-  const readingsByDay: { [dateStr: string]: any[] } = {};
-  readings.forEach((r: any) => {
-    const d = new Date(r.time);
-    const localDateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    if (!readingsByDay[localDateStr]) readingsByDay[localDateStr] = [];
-    readingsByDay[localDateStr].push(r);
-  });
-
-  const computedReadings: any[] = [];
-  Object.keys(readingsByDay).forEach((dateStr) => {
-    const dayReadings = readingsByDay[dateStr];
-    dayReadings.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-    const baseline = dayReadings[0] ? dayReadings[0].value : 0;
-    dayReadings.forEach((r) => {
-      const value = r.value - baseline;
-      computedReadings.push({ ...r, value: clampToZero ? Math.max(0, value) : value });
-    });
-  });
-
-  computedReadings.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
-  return computedReadings;
-}
-
 // Bins raw per-metric readings into one row per minute (unless overridden by timeStep), applies
 // smoothing, and applies every validated weight-drop correction. Pulled out as a pure function so
 // both the Climat/Croissance chart and the Analyseur Agronomique tab (which keeps its own,
@@ -2494,23 +2458,6 @@ export default function AranetUnifiedDashboard() {
           }
         }
       }
-
-      // Any sensor tagged "Somme de rayonnement" (radiation_sum) restarts from 0 every local
-      // midnight on the chart, whether it comes from Aranet or Priva - see resetDailyBaseline.
-      // Falls back to a name match (e.g. a custom Priva point named "... Rad sum") since a
-      // freshly added point defaults to no agro role until someone tags it by hand in "Sélection
-      // des données", and a radiation-sum sensor should reset on sight, not only once tagged.
-      Object.keys(dataMap).forEach(key => {
-        const config = metricConfigs[key];
-        const m = allMetrics.find(item => item.key === key);
-        const name = (config?.customName || m?.name || "").toLowerCase();
-        const isRadiationSum = config?.agroRole === "radiation_sum"
-          || (name.includes("rad") && name.includes("sum"))
-          || (name.includes("rayonnement") && (name.includes("somme") || name.includes("cumul")));
-        if (isRadiationSum) {
-          dataMap[key] = resetDailyBaseline(dataMap[key], { clampToZero: true });
-        }
-      });
 
       onDataMap(dataMap);
     } catch (err: any) {
