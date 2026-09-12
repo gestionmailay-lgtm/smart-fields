@@ -105,7 +105,7 @@ export default function SerresModulePage() {
             <p className="text-muted-foreground">Ouvrez votre espace et constituez un dossier.</p>
           </div>
           <Button asChild size="lg" className="rounded-xl px-8 w-full sm:w-auto">
-            <Link href="/signup">
+            <Link href="/dashboard/serres">
               Débuter avec ce module
             </Link>
           </Button>
