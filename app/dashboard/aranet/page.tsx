@@ -2454,8 +2454,17 @@ export default function AranetUnifiedDashboard() {
 
       // Any sensor tagged "Somme de rayonnement" (radiation_sum) restarts from 0 every local
       // midnight on the chart, whether it comes from Aranet or Priva - see resetDailyBaseline.
+      // Falls back to a name match (e.g. a custom Priva point named "... Rad sum") since a
+      // freshly added point defaults to no agro role until someone tags it by hand in "Sélection
+      // des données", and a radiation-sum sensor should reset on sight, not only once tagged.
       Object.keys(dataMap).forEach(key => {
-        if (metricConfigs[key]?.agroRole === "radiation_sum") {
+        const config = metricConfigs[key];
+        const m = allMetrics.find(item => item.key === key);
+        const name = (config?.customName || m?.name || "").toLowerCase();
+        const isRadiationSum = config?.agroRole === "radiation_sum"
+          || (name.includes("rad") && name.includes("sum"))
+          || (name.includes("rayonnement") && (name.includes("somme") || name.includes("cumul")));
+        if (isRadiationSum) {
           dataMap[key] = resetDailyBaseline(dataMap[key]);
         }
       });
