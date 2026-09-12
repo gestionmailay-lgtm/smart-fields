@@ -2459,6 +2459,42 @@ export default function AranetUnifiedDashboard() {
         dataMap[res.key] = res.readings;
       });
 
+      // Priva's live API only exposes a ~5-day rolling window (see the fiveDaysAgo clamp above),
+      // so a wider Analyseur Agronomique range (up to 30 days) used to leave every Priva-sourced
+      // factor (exterior/compartment climate, radiation...) empty for every day before the last
+      // few - nowhere near enough history to draw a real conclusion from. Backfill those older
+      // days from the nightly archive (aranet_daily_archive), which has no such live-API window.
+      if (privaKeys.length > 0) {
+        const todayMidnightUtc = new Date();
+        todayMidnightUtc.setUTCHours(0, 0, 0, 0);
+        const privaLiveCutoff = new Date(todayMidnightUtc.getTime() - 5 * 24 * 3600 * 1000);
+        if (rangeStart.getTime() < privaLiveCutoff.getTime()) {
+          const archiveEnd = new Date(privaLiveCutoff.getTime() - 60000);
+          const toIsoDate = (d: Date) => d.toISOString().split("T")[0];
+          try {
+            const archiveRes = await fetch(
+              `/api/aranet/archive-read?metricKeys=${encodeURIComponent(privaKeys.join(","))}&startDate=${toIsoDate(rangeStart)}&endDate=${toIsoDate(archiveEnd)}`
+            );
+            if (archiveRes.ok) {
+              const archiveJson = await archiveRes.json();
+              const archiveData: { [key: string]: { time: string; value: number }[] } = archiveJson.data || {};
+              privaKeys.forEach(key => {
+                const archived = archiveData[key] || [];
+                if (archived.length === 0) return;
+                // Merge by timestamp so the last few days' live readings (finer-grained, already
+                // in dataMap) win over the archive on any overlap instead of being duplicated.
+                const merged = new Map<number, any>();
+                archived.forEach(r => merged.set(new Date(r.time).getTime(), r));
+                (dataMap[key] || []).forEach(r => merged.set(new Date(r.time).getTime(), r));
+                dataMap[key] = Array.from(merged.values()).sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+              });
+            }
+          } catch (archiveErr) {
+            console.error("Priva archive backfill error:", archiveErr);
+          }
+        }
+      }
+
       // Any sensor tagged "Somme de rayonnement" (radiation_sum) restarts from 0 every local
       // midnight on the chart, whether it comes from Aranet or Priva - see resetDailyBaseline.
       // Falls back to a name match (e.g. a custom Priva point named "... Rad sum") since a
