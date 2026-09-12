@@ -423,7 +423,13 @@ function detectWeightMovements(
 // agro role (a daily light/radiation sum, e.g. J/cm²) so the chart always restarts its climb from
 // 0 each day instead of drifting upward across a multi-day range if the source device (Aranet or
 // Priva) doesn't already reset it exactly at midnight itself.
-function resetDailyBaseline(readings: any[]): any[] {
+// clampToZero floors every result at 0 - needed for radiation_sum specifically, since it's a
+// physically non-decreasing daily total: sensor noise can make a later reading dip slightly below
+// the very first reading of the day, which would otherwise subtract into a negative "sum" that
+// can't exist in reality. plant_weight_gain deliberately keeps allowing negative values (a real
+// drop below the midnight baseline, e.g. a harvest, is a genuine signal there).
+function resetDailyBaseline(readings: any[], options?: { clampToZero?: boolean }): any[] {
+  const clampToZero = options?.clampToZero ?? false;
   const readingsByDay: { [dateStr: string]: any[] } = {};
   readings.forEach((r: any) => {
     const d = new Date(r.time);
@@ -438,7 +444,8 @@ function resetDailyBaseline(readings: any[]): any[] {
     dayReadings.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
     const baseline = dayReadings[0] ? dayReadings[0].value : 0;
     dayReadings.forEach((r) => {
-      computedReadings.push({ ...r, value: r.value - baseline });
+      const value = r.value - baseline;
+      computedReadings.push({ ...r, value: clampToZero ? Math.max(0, value) : value });
     });
   });
 
@@ -2465,7 +2472,7 @@ export default function AranetUnifiedDashboard() {
           || (name.includes("rad") && name.includes("sum"))
           || (name.includes("rayonnement") && (name.includes("somme") || name.includes("cumul")));
         if (isRadiationSum) {
-          dataMap[key] = resetDailyBaseline(dataMap[key]);
+          dataMap[key] = resetDailyBaseline(dataMap[key], { clampToZero: true });
         }
       });
 
