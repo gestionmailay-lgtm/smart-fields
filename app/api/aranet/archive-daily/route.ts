@@ -321,6 +321,116 @@ function getDayBounds(daysAgo: number) {
   return { start, end, dateStr: start.toISOString().split("T")[0] };
 }
 
+// One calendar day's worth of archiving (Aranet catalog + Priva + agro summary), factored out of
+// GET so the nightly run can call it again for any earlier day found missing by
+// findMissingPrivaDaysAgo below - re-running a day is safe/idempotent thanks to the
+// metric_key+reading_time upsert key.
+async function archiveOneDay(
+  supabase: ReturnType<typeof createAdminClient>,
+  daysAgo: number,
+  metricKeys: string[],
+  roleByMetricKey: Map<string, string>
+) {
+  const { start, end, dateStr } = getDayBounds(daysAgo);
+
+  let totalArchived = 0;
+  const errors: string[] = [];
+
+  for (const metricKey of metricKeys) {
+    const { sensorId, metricId, defaultUnit } = ARANET_SENSOR_CATALOG[metricKey];
+    try {
+      // "metric" scopes the request to this one channel - without it, the Aranet API's
+      // ~10000-reading cap is shared across every metric of the sensor (temp, VWC, EC...),
+      // silently dropping whichever metrics are returned last once the window is wide enough
+      // (same bug found and fixed in app/api/aranet/route.ts's live history endpoint).
+      // "days" must reach back far enough to cover the target day, not just yesterday.
+      const params = new URLSearchParams({ sensor: sensorId, metric: metricId, days: String(daysAgo + 1), unit: defaultUnit });
+      const res = await fetch(`${BASE_URL}/measurements/history?${params.toString()}`, { headers });
+      if (!res.ok) throw new Error(`Aranet API ${res.status}`);
+      const data = await res.json();
+      const readings: any[] = (data.readings || []).filter((r: any) => r.metric === metricId);
+
+      // Bin to one value per minute, keep only the target day's window.
+      const perMinute = new Map<number, number>();
+      readings.forEach(r => {
+        const t = new Date(r.time);
+        if (t < start || t >= end) return;
+        t.setSeconds(0, 0);
+        perMinute.set(t.getTime(), Number(r.value));
+      });
+
+      if (perMinute.size === 0) continue;
+
+      const rows = Array.from(perMinute.entries()).map(([timeMs, value]) => ({
+        metric_key: metricKey,
+        reading_time: new Date(timeMs).toISOString(),
+        value,
+        unit: defaultUnit,
+        archived_for_date: dateStr,
+        agro_role: roleByMetricKey.get(metricKey) || null,
+        compartment: resolveCompartment(metricKey, roleByMetricKey.get(metricKey) || null)
+      }));
+
+      // Chunk inserts to stay well under request size limits.
+      for (let i = 0; i < rows.length; i += 500) {
+        const chunk = rows.slice(i, i + 500);
+        const { error: insertError } = await supabase
+          .from("aranet_daily_archive")
+          .upsert(chunk, { onConflict: "metric_key,reading_time" });
+        if (insertError) throw insertError;
+        totalArchived += chunk.length;
+      }
+    } catch (err: any) {
+      errors.push(`${metricKey}: ${err.message}`);
+    }
+  }
+
+  let privaResult: any = null;
+  try {
+    privaResult = await archivePrivaForDay(supabase, start, end, dateStr, daysAgo, roleByMetricKey);
+  } catch (err: any) {
+    console.error("Priva archive error:", err);
+    privaResult = { skipped: true, reason: err.message || "Erreur d'archivage Priva." };
+  }
+
+  let agroSummary: any = null;
+  try {
+    agroSummary = await computeAndUpsertAgroSummary(supabase, dateStr, roleByMetricKey);
+  } catch (err: any) {
+    console.error("agro_daily_summary computation error:", err);
+    agroSummary = { error: err.message || "Erreur de calcul du résumé agronomique." };
+  }
+
+  return {
+    archivedForDate: dateStr,
+    archived: totalArchived,
+    sensorsProcessed: metricKeys.length,
+    errors: errors.length > 0 ? errors : undefined,
+    priva: privaResult,
+    agroSummary
+  };
+}
+
+// Priva's rolling window (PRIVA_MAX_DAYS_AGO) is the real deadline: once a day falls outside it,
+// its Priva data is gone for good, no matter what we do. A single failed cron run (Vercel hiccup,
+// Priva outage, transient network error) used to mean silently losing that day once 5 more nights
+// passed. Called only for the standard nightly run (daysAgo === 1, see GET below) so a manual
+// backfill of one specific older day doesn't also kick off a wider sweep.
+async function findMissingPrivaDaysAgo(supabase: ReturnType<typeof createAdminClient>): Promise<number[]> {
+  const missing: number[] = [];
+  for (let daysAgo = 2; daysAgo <= PRIVA_MAX_DAYS_AGO; daysAgo++) {
+    const { dateStr } = getDayBounds(daysAgo);
+    const { count, error } = await supabase
+      .from("aranet_daily_archive")
+      .select("metric_key", { count: "exact", head: true })
+      .eq("archived_for_date", dateStr)
+      .like("metric_key", "priva_%");
+    if (error) throw error;
+    if (!count) missing.push(daysAgo);
+  }
+  return missing;
+}
+
 export async function GET(req: NextRequest) {
   // Vercel Cron sends this header automatically; also allow a manual Bearer token for testing.
   const authHeader = req.headers.get("authorization");
@@ -333,7 +443,6 @@ export async function GET(req: NextRequest) {
     const supabase = createAdminClient();
     const daysAgoParam = parseInt(req.nextUrl.searchParams.get("daysAgo") || "1", 10);
     const daysAgo = Number.isFinite(daysAgoParam) && daysAgoParam >= 1 ? daysAgoParam : 1;
-    const { start, end, dateStr } = getDayBounds(daysAgo);
 
     // Every Aranet sensor in the catalog is archived unconditionally every night, not only
     // whichever ones a user happened to have checked in the dashboard - "toutes les données".
@@ -350,82 +459,29 @@ export async function GET(req: NextRequest) {
     if (rolesError) throw rolesError;
     const roleByMetricKey = new Map((roleRows || []).map(r => [r.metric_key, r.agro_role]));
 
-    let totalArchived = 0;
-    const errors: string[] = [];
+    const primaryResult = await archiveOneDay(supabase, daysAgo, metricKeys, roleByMetricKey);
 
-    for (const metricKey of metricKeys) {
-      const { sensorId, metricId, defaultUnit } = ARANET_SENSOR_CATALOG[metricKey];
-      try {
-        // "metric" scopes the request to this one channel - without it, the Aranet API's
-        // ~10000-reading cap is shared across every metric of the sensor (temp, VWC, EC...),
-        // silently dropping whichever metrics are returned last once the window is wide enough
-        // (same bug found and fixed in app/api/aranet/route.ts's live history endpoint).
-        // "days" must reach back far enough to cover the target day, not just yesterday.
-        const params = new URLSearchParams({ sensor: sensorId, metric: metricId, days: String(daysAgo + 1), unit: defaultUnit });
-        const res = await fetch(`${BASE_URL}/measurements/history?${params.toString()}`, { headers });
-        if (!res.ok) throw new Error(`Aranet API ${res.status}`);
-        const data = await res.json();
-        const readings: any[] = (data.readings || []).filter((r: any) => r.metric === metricId);
-
-        // Bin to one value per minute, keep only yesterday's window.
-        const perMinute = new Map<number, number>();
-        readings.forEach(r => {
-          const t = new Date(r.time);
-          if (t < start || t >= end) return;
-          t.setSeconds(0, 0);
-          perMinute.set(t.getTime(), Number(r.value));
-        });
-
-        if (perMinute.size === 0) continue;
-
-        const rows = Array.from(perMinute.entries()).map(([timeMs, value]) => ({
-          metric_key: metricKey,
-          reading_time: new Date(timeMs).toISOString(),
-          value,
-          unit: defaultUnit,
-          archived_for_date: dateStr,
-          agro_role: roleByMetricKey.get(metricKey) || null,
-          compartment: resolveCompartment(metricKey, roleByMetricKey.get(metricKey) || null)
-        }));
-
-        // Chunk inserts to stay well under request size limits.
-        for (let i = 0; i < rows.length; i += 500) {
-          const chunk = rows.slice(i, i + 500);
-          const { error: insertError } = await supabase
-            .from("aranet_daily_archive")
-            .upsert(chunk, { onConflict: "metric_key,reading_time" });
-          if (insertError) throw insertError;
-          totalArchived += chunk.length;
+    // Self-heal: on the standard nightly run, also catch up any earlier day within Priva's window
+    // that never got archived (a previous night's cron failed outright, timed out, etc.) before it
+    // falls out of reach for good.
+    let backfilled: any[] | undefined;
+    if (daysAgo === 1) {
+      const missingDaysAgo = await findMissingPrivaDaysAgo(supabase).catch(err => {
+        console.error("findMissingPrivaDaysAgo error:", err);
+        return [] as number[];
+      });
+      if (missingDaysAgo.length > 0) {
+        backfilled = [];
+        for (const missingDaysAgoValue of missingDaysAgo) {
+          backfilled.push(await archiveOneDay(supabase, missingDaysAgoValue, metricKeys, roleByMetricKey));
         }
-      } catch (err: any) {
-        errors.push(`${metricKey}: ${err.message}`);
       }
-    }
-
-    let privaResult: any = null;
-    try {
-      privaResult = await archivePrivaForDay(supabase, start, end, dateStr, daysAgo, roleByMetricKey);
-    } catch (err: any) {
-      console.error("Priva archive error:", err);
-      privaResult = { skipped: true, reason: err.message || "Erreur d'archivage Priva." };
-    }
-
-    let agroSummary: any = null;
-    try {
-      agroSummary = await computeAndUpsertAgroSummary(supabase, dateStr, roleByMetricKey);
-    } catch (err: any) {
-      console.error("agro_daily_summary computation error:", err);
-      agroSummary = { error: err.message || "Erreur de calcul du résumé agronomique." };
     }
 
     return NextResponse.json({
       success: true,
-      archivedForDate: dateStr,
-      archived: totalArchived,
-      sensorsProcessed: metricKeys.length,
-      errors: errors.length > 0 ? errors : undefined,
-      priva: privaResult,
-      agroSummary
+      ...primaryResult,
+      backfilled
     });
   } catch (error: any) {
     console.error("Archive daily error:", error);
