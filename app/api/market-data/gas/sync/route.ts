@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
 
@@ -16,7 +16,14 @@ function getQuarterFromMonth(monthStr: string) {
     return null;
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+    // Vercel Cron sends this header automatically; also allow a manual Bearer token for testing.
+    const authHeader = req.headers.get("authorization");
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     try {
         const apiKey = process.env.GOOGLE_AI_API_KEY;
         if (!apiKey) throw new Error("Clé API manquante");

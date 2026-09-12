@@ -3,6 +3,10 @@
     {
       "path": "/api/aranet/archive-daily",
       "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/market-data/gas/sync",
+      "schedule": "0 3 * * *"
     }
   ]
 }
