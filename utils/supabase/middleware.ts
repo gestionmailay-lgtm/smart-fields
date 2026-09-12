@@ -27,28 +27,10 @@ export async function updateSession(request: NextRequest) {
     }
   )
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  // Protection du dashboard (exclut le module serres et aranet pour permettre l'accès anonyme)
-  if (
-    !user &&
-    request.nextUrl.pathname.startsWith("/dashboard") &&
-    !request.nextUrl.pathname.startsWith("/dashboard/serres") &&
-    !request.nextUrl.pathname.startsWith("/dashboard/aranet")
-  ) {
-    const url = request.nextUrl.clone()
-    url.pathname = "/login"
-    return NextResponse.redirect(url)
-  }
-
-  // Redirection automatique si on est déjà connecté
-  if (user && (request.nextUrl.pathname === "/login" || request.nextUrl.pathname === "/signup")) {
-    const url = request.nextUrl.clone()
-    url.pathname = "/dashboard"
-    return NextResponse.redirect(url)
-  }
+  // No auth gate: every module (dashboard, serres, aranet, cereales, porc...) is reachable
+  // without logging in. supabase.auth.getUser() is still called above so the session cookie
+  // keeps refreshing for whatever code still reads it, but nothing here redirects on its result.
+  await supabase.auth.getUser()
 
   return supabaseResponse
 }

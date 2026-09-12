@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { createClient } from "@/utils/supabase/server"
-import { redirect } from "next/navigation"
 import Link from "next/link"
 import { Wheat, Leaf, Activity, LogOut, LayoutDashboard, Settings, User, Flame, Droplets, TrendingUp } from "lucide-react"
 
@@ -61,15 +60,9 @@ export default async function DashboardPage() {
 
   const { data: { user } } = await supabase.auth.getUser()
 
-  if (!user) {
-    redirect("/login")
-  }
-
-  const { data: profile } = await supabase
-    .from("users")
-    .select("*")
-    .eq("id", user.id)
-    .single()
+  const { data: profile } = user
+    ? await supabase.from("users").select("*").eq("id", user.id).single()
+    : { data: null }
 
   return (
     <div className="flex min-h-screen w-full flex-col bg-muted/20">
@@ -89,15 +82,19 @@ export default async function DashboardPage() {
           <span className="text-sm font-medium">Marchés & Stratégies</span>
         </div>
         <div className="flex items-center gap-4">
-          <div className="hidden md:flex flex-col items-end mr-2">
-            <span className="text-sm font-semibold">{profile?.company_name || user.email}</span>
-            <span className="text-xs text-muted-foreground">{user.email}</span>
-          </div>
-          <form action="/auth/signout" method="post">
-            <Button variant="ghost" size="icon" title="Se déconnecter">
-              <LogOut className="h-5 w-5" />
-            </Button>
-          </form>
+          {user && (
+            <>
+              <div className="hidden md:flex flex-col items-end mr-2">
+                <span className="text-sm font-semibold">{profile?.company_name || user.email}</span>
+                <span className="text-xs text-muted-foreground">{user.email}</span>
+              </div>
+              <form action="/auth/signout" method="post">
+                <Button variant="ghost" size="icon" title="Se déconnecter">
+                  <LogOut className="h-5 w-5" />
+                </Button>
+              </form>
+            </>
+          )}
         </div>
       </header>
 
