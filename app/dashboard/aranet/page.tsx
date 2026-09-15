@@ -2459,6 +2459,33 @@ export default function AranetUnifiedDashboard() {
         }
       }
 
+      // Add a synthetic 0-value point at 00:01 every day for any "Somme de rayonnement"
+      // (radiation_sum) sensor, so the chart always has a hard anchor back down to 0 right after
+      // midnight - without altering any real reading, unlike the baseline-subtraction/floor
+      // approach tried earlier (reverted: it distorted the actual sensor values). Matched by agro
+      // role tag or by name ("Rad sum", "Somme de rayonnement"), same heuristic as elsewhere.
+      Object.keys(dataMap).forEach(key => {
+        const config = metricConfigs[key];
+        const m = allMetrics.find(item => item.key === key);
+        const name = (config?.customName || m?.name || "").toLowerCase();
+        const isRadiationSum = config?.agroRole === "radiation_sum"
+          || (name.includes("rad") && name.includes("sum"))
+          || (name.includes("rayonnement") && (name.includes("somme") || name.includes("cumul")));
+        if (!isRadiationSum) return;
+
+        const zeroPoints: any[] = [];
+        const cursor = new Date(rangeStart);
+        cursor.setHours(0, 1, 0, 0);
+        if (cursor.getTime() < rangeStart.getTime()) cursor.setDate(cursor.getDate() + 1);
+        while (cursor.getTime() <= rangeEnd.getTime()) {
+          zeroPoints.push({ time: new Date(cursor).toISOString(), value: 0 });
+          cursor.setDate(cursor.getDate() + 1);
+        }
+
+        dataMap[key] = [...(dataMap[key] || []), ...zeroPoints]
+          .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+      });
+
       onDataMap(dataMap);
     } catch (err: any) {
       console.error(err);
